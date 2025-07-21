@@ -704,7 +704,7 @@ fn regex(inp: &str) -> IResult<&str, UserInputLeaf> {
                 many1(alt((preceded(char('\\'), char('/')), none_of("/")))),
                 char('/'),
             ),
-            alt((multispace1, eof)),
+            peek(alt((multispace1, eof))),
         ),
         |elements| UserInputLeaf::Regex {
             field: None,
@@ -721,7 +721,7 @@ fn regex_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
             opt_i_err(char('/'), "missing delimiter /"),
         ),
         opt_i_err(
-            alt((multispace1, eof)),
+            peek(alt((multispace1, eof))),
             "expected whitespace or end of input",
         ),
     )(inp)
