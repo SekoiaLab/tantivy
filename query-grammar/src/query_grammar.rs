@@ -36,7 +36,7 @@ fn field_name(inp: &str) -> IResult<&str, String> {
                 alt((first_char, escape_sequence())),
                 many0(alt((simple_char, escape_sequence(), char('\\')))),
             )),
-            tuple((char(':'), multispace0)),
+            tuple((multispace0, char(':'), multispace0)),
         ),
         |(first_char, next)| once(first_char).chain(next).collect(),
     )(inp)
@@ -1346,7 +1346,7 @@ mod test {
             Ok(("a", "~my~field".to_string()))
         );
         assert_eq!(
-            super::field_name(".my.field.name: a"),
+            super::field_name(".my.field.name : a"),
             Ok(("a", ".my.field.name".to_string()))
         );
         for special_char in SPECIAL_CHARS.iter() {
