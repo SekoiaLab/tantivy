@@ -1,5 +1,6 @@
+mod map;
+
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::net::Ipv6Addr;
 
@@ -9,10 +10,12 @@ use columnar::{
 };
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::aggregation::agg_req_with_accessor::{
     AggregationWithAccessor, AggregationsWithAccessor, CompositeAccessor,
 };
+use crate::aggregation::bucket::composite::map::{DynArrayHeapMap, MAX_DYN_ARRAY_SIZE};
 use crate::aggregation::bucket::Order;
 use crate::aggregation::format_date;
 use crate::aggregation::intermediate_agg_result::{
@@ -219,7 +222,7 @@ impl CompositeBucketCollector {
 ///   - 0 if the field is missing
 ///   - regular u64 repr if the ordering is ascending
 ///   - bitwise NOT of the u64 repr if the ordering is descending
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 struct InternalValueRepr(u8, u64);
 
 impl InternalValueRepr {
@@ -252,19 +255,11 @@ impl InternalValueRepr {
     }
 }
 
-/// The value is represented as a tuple of:
-/// - the column index the value was extracted from
-/// - the fast field value u64 representation
-#[derive(Clone, Debug, Default)]
-struct CompositeBuckets {
-    pub(crate) buckets: BTreeMap<Vec<InternalValueRepr>, CompositeBucketCollector>,
-}
-
 /// The collector puts values from the fast field into the correct buckets and
 /// does a conversion to the correct datatype.
 #[derive(Clone, Debug)]
 pub struct SegmentCompositeCollector {
-    buckets: CompositeBuckets,
+    buckets: DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
     req: CompositeAggregation,
     blueprint: Option<Box<dyn SegmentAggregationCollector>>,
     accessor_idx: usize,
@@ -310,7 +305,7 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
         let mem_pre = self.get_memory_consumption();
 
         for doc in docs {
-            let mut sub_level_values = Vec::with_capacity(accessors.len());
+            let mut sub_level_values = SmallVec::new();
             recursive_key_visitor(
                 *doc,
                 &self.blueprint,
@@ -335,7 +330,7 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
         let sub_aggregation_accessor =
             &mut agg_with_accessor.aggs.values[self.accessor_idx].sub_aggregation;
 
-        for sub_agg_collector in self.buckets.buckets.values_mut() {
+        for sub_agg_collector in self.buckets.values_mut() {
             if let Some(sub_aggs_collector) = &mut sub_agg_collector.sub_aggs {
                 sub_aggs_collector.flush(sub_aggregation_accessor)?;
             }
@@ -347,7 +342,7 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
 impl SegmentCompositeCollector {
     fn get_memory_consumption(&self) -> u64 {
         // TODO get correct estimate (these are just the keys)
-        (self.buckets.buckets.len() * (std::mem::size_of::<InternalValueRepr>())) as u64
+        (self.buckets.size() * (std::mem::size_of::<InternalValueRepr>())) as u64
     }
 
     pub(crate) fn from_req_and_validate(
@@ -372,6 +367,11 @@ impl SegmentCompositeCollector {
                 return Err(TantivyError::InvalidArgument(
                     "composite aggregation source must have at least one accessor".to_string(),
                 ));
+            }
+            if source_columns.len() > MAX_DYN_ARRAY_SIZE {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "composite aggregation source supports maximum {MAX_DYN_ARRAY_SIZE} sources",
+                )));
             }
             if source_columns.contains(&ColumnType::Bytes) {
                 return Err(TantivyError::InvalidArgument(
@@ -399,7 +399,7 @@ impl SegmentCompositeCollector {
         };
 
         Ok(SegmentCompositeCollector {
-            buckets: CompositeBuckets::default(),
+            buckets: DynArrayHeapMap::try_new(req.sources.len())?,
             req: req.clone(),
             blueprint,
             accessor_idx,
@@ -413,10 +413,9 @@ impl SegmentCompositeCollector {
     ) -> crate::Result<IntermediateCompositeBucketResult> {
         let mut dict: FxHashMap<Vec<Option<IntermediateKey>>, IntermediateCompositeBucketEntry> =
             Default::default();
-        dict.reserve(self.buckets.buckets.len());
-
-        for (key_internal_repr, agg) in self.buckets.buckets {
-            let key = resolve_key(key_internal_repr, &self.req.sources, agg_with_accessor)?;
+        dict.reserve(self.buckets.size());
+        for (key_internal_repr, agg) in self.buckets.into_iter() {
+            let key = resolve_key(&key_internal_repr, &self.req.sources, agg_with_accessor)?;
             let mut sub_aggregation_res = IntermediateAggregationResults::default();
             if let Some(sub_aggs_collector) = agg.sub_aggs {
                 sub_aggs_collector.add_intermediate_aggregation_result(
@@ -452,37 +451,40 @@ impl SegmentCompositeCollector {
 fn collect_bucket_with_limit(
     doc_id: crate::DocId,
     sub_aggregation: &mut AggregationsWithAccessor,
-    buckets: &mut CompositeBuckets,
-    key: &Vec<InternalValueRepr>,
+    buckets: &mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
+    key: &[InternalValueRepr],
     blueprint: &Option<Box<dyn SegmentAggregationCollector>>,
     limit: u32,
 ) -> crate::Result<()> {
-    let buckets = &mut buckets.buckets;
-    if (buckets.len() as u32) < limit {
+    // we still have room for buckets, just insert
+    if (buckets.size() as u32) < limit {
         buckets
-            .entry(key.clone())
-            .or_insert_with(|| CompositeBucketCollector::new(blueprint.clone()))
+            .get_or_insert_with(key, || CompositeBucketCollector::new(blueprint.clone()))
             .collect(doc_id, sub_aggregation)?;
         return Ok(());
     }
+
+    // map is full, but we can still update the bucket if it already exists
     if let Some(entry) = buckets.get_mut(key) {
         entry.collect(doc_id, sub_aggregation)?;
         return Ok(());
     }
-    let last_entry = buckets.last_entry().unwrap();
-    if key < last_entry.key() {
-        // we have a better bucket, evict the worst one
-        last_entry.remove();
-        buckets
-            .entry(key.clone())
-            .or_insert_with(|| CompositeBucketCollector::new(blueprint.clone()))
-            .collect(doc_id, sub_aggregation)?;
+
+    // check if the item qualfies to enter the top-k, and evict the highest if it does
+    if let Some(highest_key) = buckets.peek_highest() {
+        if key < highest_key {
+            buckets.evict_highest();
+            buckets
+                .get_or_insert_with(key, || CompositeBucketCollector::new(blueprint.clone()))
+                .collect(doc_id, sub_aggregation)?;
+        }
     }
+
     Ok(())
 }
 
 fn resolve_key(
-    internal_key: Vec<InternalValueRepr>,
+    internal_key: &[InternalValueRepr],
     sources: &[CompositeAggregationSource],
     agg_with_accessor: &AggregationWithAccessor,
 ) -> crate::Result<Vec<Option<IntermediateKey>>> {
@@ -491,7 +493,7 @@ fn resolve_key(
         .enumerate()
         .map(|(idx, val)| {
             resolve_internal_value_repr(
-                val,
+                *val,
                 &sources[idx],
                 &agg_with_accessor.composite_accessors[idx],
             )
@@ -579,8 +581,8 @@ fn recursive_key_visitor(
     sub_aggregation: &mut AggregationsWithAccessor,
     accessors: &[Vec<CompositeAccessor>],
     sources: &[CompositeAggregationSource],
-    sub_level_values: &mut Vec<InternalValueRepr>,
-    buckets: &mut CompositeBuckets,
+    sub_level_values: &mut SmallVec<[InternalValueRepr; MAX_DYN_ARRAY_SIZE]>,
+    buckets: &mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
 ) -> crate::Result<()> {
     if accessors.is_empty() {
         collect_bucket_with_limit(

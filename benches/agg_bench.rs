@@ -61,6 +61,10 @@ fn bench_agg(mut group: InputGroup<Index>) {
     register!(group, terms_many_with_avg_sub_agg);
     register!(group, terms_many_json_mixed_type_with_avg_sub_agg);
 
+    register!(group, composite_term_many_page_1000);
+    register!(group, composite_term_many_page_1000_with_avg_sub_agg);
+    register!(group, composite_term_few);
+
     register!(group, cardinality_agg);
     register!(group, terms_few_with_cardinality_agg);
 
@@ -217,6 +221,49 @@ fn terms_many_json_mixed_type_with_avg_sub_agg(index: &Index) {
     let agg_req = json!({
         "my_texts": {
             "terms": { "field": "json.mixed_type" },
+            "aggs": {
+                "average_f64": { "avg": { "field": "score_f64" } }
+            }
+        },
+    });
+    execute_agg(index, agg_req);
+}
+fn composite_term_few(index: &Index) {
+    let agg_req = json!({
+        "my_texts": {
+            "composite": {
+                "sources": [
+                    { "text_few_terms": { "terms": { "field": "text_few_terms" } } }
+                ],
+                "size": 1000
+            }
+        },
+    });
+    execute_agg(index, agg_req);
+}
+fn composite_term_many_page_1000(index: &Index) {
+    let agg_req = json!({
+        "my_texts": {
+            "composite": {
+                "sources": [
+                    { "text_many_terms": { "terms": { "field": "text_many_terms" } } }
+                ],
+                "size": 1000
+            }
+        },
+    });
+    execute_agg(index, agg_req);
+}
+fn composite_term_many_page_1000_with_avg_sub_agg(index: &Index) {
+    let agg_req = json!({
+        "my_texts": {
+            "composite": {
+                "sources": [
+                    { "text_many_terms": { "terms": { "field": "text_many_terms" } } }
+                ],
+                "size": 1000,
+
+            },
             "aggs": {
                 "average_f64": { "avg": { "field": "score_f64" } }
             }
