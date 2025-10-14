@@ -341,8 +341,9 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
 
 impl SegmentCompositeCollector {
     fn get_memory_consumption(&self) -> u64 {
-        // TODO get correct estimate (these are just the keys)
-        (self.buckets.size() * (std::mem::size_of::<InternalValueRepr>())) as u64
+        // TODO: the footprint is underestimated because we don't account for the
+        // sub-aggregations which are trait objects
+        self.buckets.memory_consumption()
     }
 
     pub(crate) fn from_req_and_validate(
@@ -601,6 +602,7 @@ fn recursive_key_visitor(
     let sub_level_sources = &sources[1..];
     let mut missing = true;
     for (i, accessor) in current_level_accessor.iter().enumerate() {
+        // TODO: optimize with prefetching using fetch_block
         let values = accessor.column.values_for_doc(doc_id);
         match current_level_source {
             CompositeAggregationSource::Terms(term_source) => {

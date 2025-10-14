@@ -49,6 +49,13 @@ impl<K: Eq + Hash + Clone + Ord, V, const S: usize> ArrayHeapMap<K, V, S> {
             self.buckets.remove(&highest);
         }
     }
+
+    fn memory_consumption(&self) -> u64 {
+        let key_size = std::mem::size_of::<[K; S]>();
+        let map_size = (key_size + std::mem::size_of::<V>()) * self.buckets.capacity();
+        let heap_size = key_size * self.heap.capacity();
+        (map_size + heap_size) as u64
+    }
 }
 
 impl<K: Copy + Ord + Clone + 'static, V: 'static, const S: usize> ArrayHeapMap<K, V, S> {
@@ -247,6 +254,27 @@ impl<K: Ord + Hash + Clone, V> DynArrayHeapMap<K, V> {
             DynArrayHeapMapInner::Dim14(map) => map.evict_highest(),
             DynArrayHeapMapInner::Dim15(map) => map.evict_highest(),
             DynArrayHeapMapInner::Dim16(map) => map.evict_highest(),
+        }
+    }
+
+    pub(crate) fn memory_consumption(&self) -> u64 {
+        match &self.0 {
+            DynArrayHeapMapInner::Dim1(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim2(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim3(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim4(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim5(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim6(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim7(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim8(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim9(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim10(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim11(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim12(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim13(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim14(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim15(map) => map.memory_consumption(),
+            DynArrayHeapMapInner::Dim16(map) => map.memory_consumption(),
         }
     }
 }
