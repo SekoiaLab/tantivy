@@ -217,15 +217,10 @@ impl AggregationVariants {
             _ => None,
         }
     }
+
     pub(crate) fn as_composite(&self) -> Option<&CompositeAggregation> {
         match &self {
             AggregationVariants::Composite(composite) => Some(composite),
-            _ => None,
-        }
-    }
-    pub(crate) fn as_top_hits(&self) -> Option<&TopHitsAggregationReq> {
-        match &self {
-            AggregationVariants::TopHits(top_hits) => Some(top_hits),
             _ => None,
         }
     }

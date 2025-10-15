@@ -6,14 +6,15 @@ use std::net::Ipv6Addr;
 
 use columnar::column_values::CompactSpaceU64Accessor;
 use columnar::{
-    ColumnType, Dictionary, MonotonicallyMappableToU128, MonotonicallyMappableToU64, NumericalValue,
+    Column, ColumnType, Dictionary, MonotonicallyMappableToU128, MonotonicallyMappableToU64,
+    NumericalValue, StrColumn,
 };
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::aggregation::agg_req_with_accessor::{
-    AggregationWithAccessor, AggregationsWithAccessor, CompositeAccessor,
+use crate::aggregation::agg_data::{
+    build_segment_agg_collectors, AggRefNode, AggregationsSegmentCtx,
 };
 use crate::aggregation::bucket::composite::map::{DynArrayHeapMap, MAX_DYN_ARRAY_SIZE};
 use crate::aggregation::bucket::Order;
@@ -22,9 +23,7 @@ use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
     IntermediateCompositeBucketEntry, IntermediateCompositeBucketResult, IntermediateKey,
 };
-use crate::aggregation::segment_agg_result::{
-    build_segment_agg_collector, SegmentAggregationCollector,
-};
+use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
 use crate::TantivyError;
 
 /// The position of missing keys in the ordering
@@ -204,11 +203,11 @@ impl CompositeBucketCollector {
     fn collect(
         &mut self,
         doc: crate::DocId,
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
         self.count += 1;
         if let Some(sub_aggs) = &mut self.sub_aggs {
-            sub_aggs.collect(doc, agg_with_accessor)?;
+            sub_aggs.collect(doc, agg_data)?;
         }
         Ok(())
     }
@@ -260,22 +259,21 @@ impl InternalValueRepr {
 #[derive(Clone, Debug)]
 pub struct SegmentCompositeCollector {
     buckets: DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
-    req: CompositeAggregation,
-    blueprint: Option<Box<dyn SegmentAggregationCollector>>,
     accessor_idx: usize,
 }
 
 impl SegmentAggregationCollector for SegmentCompositeCollector {
     fn add_intermediate_aggregation_result(
         self: Box<Self>,
-        agg_with_accessor: &AggregationsWithAccessor,
+        agg_data: &AggregationsSegmentCtx,
         results: &mut IntermediateAggregationResults,
     ) -> crate::Result<()> {
-        let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
-        let agg_with_accessor = &agg_with_accessor.aggs.values[self.accessor_idx];
+        let name = agg_data
+            .get_composite_req_data(self.accessor_idx)
+            .name
+            .clone();
 
-        let buckets = self.into_intermediate_bucket_result(agg_with_accessor)?;
-
+        let buckets = self.into_intermediate_bucket_result(agg_data)?;
         results.push(
             name,
             IntermediateAggregationResult::Bucket(IntermediateBucketResult::Composite { buckets }),
@@ -288,51 +286,45 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
     fn collect(
         &mut self,
         doc: crate::DocId,
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        self.collect_block(&[doc], agg_with_accessor)
+        self.collect_block(&[doc], agg_data)
     }
 
     #[inline]
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &mut AggregationsWithAccessor,
+        agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        let bucket_agg_accessor = &mut agg_with_accessor.aggs.values[self.accessor_idx];
-        let accessors = &bucket_agg_accessor.composite_accessors;
-
         let mem_pre = self.get_memory_consumption();
+        let composite_agg_data = agg_data.take_composite_req_data(self.accessor_idx);
 
         for doc in docs {
             let mut sub_level_values = SmallVec::new();
             recursive_key_visitor(
                 *doc,
-                &self.blueprint,
-                self.req.size,
-                &mut bucket_agg_accessor.sub_aggregation,
-                accessors,
-                &self.req.sources,
+                agg_data,
+                &composite_agg_data,
+                0,
                 &mut sub_level_values,
                 &mut self.buckets,
             )?;
         }
+        agg_data.put_back_composite_req_data(self.accessor_idx, composite_agg_data);
 
         let mem_delta = self.get_memory_consumption() - mem_pre;
         if mem_delta > 0 {
-            bucket_agg_accessor.limits.add_memory_consumed(mem_delta)?;
+            agg_data.limits.add_memory_consumed(mem_delta)?;
         }
 
         Ok(())
     }
 
-    fn flush(&mut self, agg_with_accessor: &mut AggregationsWithAccessor) -> crate::Result<()> {
-        let sub_aggregation_accessor =
-            &mut agg_with_accessor.aggs.values[self.accessor_idx].sub_aggregation;
-
+    fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {
         for sub_agg_collector in self.buckets.values_mut() {
             if let Some(sub_aggs_collector) = &mut sub_agg_collector.sub_aggs {
-                sub_aggs_collector.flush(sub_aggregation_accessor)?;
+                sub_aggs_collector.flush(agg_data)?;
             }
         }
         Ok(())
@@ -346,12 +338,9 @@ impl SegmentCompositeCollector {
         self.buckets.memory_consumption()
     }
 
-    pub(crate) fn from_req_and_validate(
-        req: &CompositeAggregation,
-        sub_aggregations: &mut AggregationsWithAccessor,
-        col_types: &[Vec<ColumnType>], // for validation
-        accessor_idx: usize,
-    ) -> crate::Result<Self> {
+    fn validate(req_data: &mut AggregationsSegmentCtx, accessor_idx: usize) -> crate::Result<()> {
+        let composite_data = req_data.get_composite_req_data(accessor_idx);
+        let req = &composite_data.req;
         if req.sources.is_empty() {
             return Err(TantivyError::InvalidArgument(
                 "composite aggregation must have at least one source".to_string(),
@@ -362,6 +351,10 @@ impl SegmentCompositeCollector {
                 "composite aggregation 'size' must be > 0".to_string(),
             ));
         }
+        let col_types = composite_data
+            .composite_accessors
+            .iter()
+            .map(|accessors| accessors.iter().map(|a| a.column_type).collect::<Vec<_>>());
 
         for source_columns in col_types {
             if source_columns.is_empty() {
@@ -391,38 +384,46 @@ impl SegmentCompositeCollector {
                 ));
             }
         }
+        Ok(())
+    }
 
-        let blueprint = if !sub_aggregations.is_empty() {
-            let sub_aggregation = build_segment_agg_collector(sub_aggregations)?;
+    pub(crate) fn from_req_and_validate(
+        req_data: &mut AggregationsSegmentCtx,
+        node: &AggRefNode,
+    ) -> crate::Result<Self> {
+        Self::validate(req_data, node.idx_in_req_data)?;
+
+        let has_sub_aggregations = !node.children.is_empty();
+        let blueprint = if has_sub_aggregations {
+            let sub_aggregation = build_segment_agg_collectors(req_data, &node.children)?;
             Some(sub_aggregation)
         } else {
             None
         };
+        let composite_req_data = req_data.get_composite_req_data_mut(node.idx_in_req_data);
+        composite_req_data.sub_aggregation_blueprint = blueprint;
 
         Ok(SegmentCompositeCollector {
-            buckets: DynArrayHeapMap::try_new(req.sources.len())?,
-            req: req.clone(),
-            blueprint,
-            accessor_idx,
+            buckets: DynArrayHeapMap::try_new(composite_req_data.req.sources.len())?,
+            accessor_idx: node.idx_in_req_data,
         })
     }
 
     #[inline]
     pub(crate) fn into_intermediate_bucket_result(
         self,
-        agg_with_accessor: &AggregationWithAccessor,
+        agg_data: &AggregationsSegmentCtx,
     ) -> crate::Result<IntermediateCompositeBucketResult> {
         let mut dict: FxHashMap<Vec<Option<IntermediateKey>>, IntermediateCompositeBucketEntry> =
             Default::default();
         dict.reserve(self.buckets.size());
+        let composite_data = agg_data.get_composite_req_data(self.accessor_idx);
         for (key_internal_repr, agg) in self.buckets.into_iter() {
-            let key = resolve_key(&key_internal_repr, &self.req.sources, agg_with_accessor)?;
+            let key = resolve_key(&key_internal_repr, composite_data)?;
             let mut sub_aggregation_res = IntermediateAggregationResults::default();
             if let Some(sub_aggs_collector) = agg.sub_aggs {
-                sub_aggs_collector.add_intermediate_aggregation_result(
-                    &agg_with_accessor.sub_aggregation,
-                    &mut sub_aggregation_res,
-                )?;
+                sub_aggs_collector
+                    .add_intermediate_aggregation_result(agg_data, &mut sub_aggregation_res)?;
             }
 
             dict.insert(
@@ -436,8 +437,8 @@ impl SegmentCompositeCollector {
 
         Ok(IntermediateCompositeBucketResult {
             entries: dict,
-            target_size: self.req.size,
-            orders: self
+            target_size: composite_data.req.size,
+            orders: composite_data
                 .req
                 .sources
                 .iter()
@@ -451,23 +452,24 @@ impl SegmentCompositeCollector {
 
 fn collect_bucket_with_limit(
     doc_id: crate::DocId,
-    sub_aggregation: &mut AggregationsWithAccessor,
+    agg_data: &mut AggregationsSegmentCtx,
+    composite_agg_data: &CompositeAggReqData,
     buckets: &mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
     key: &[InternalValueRepr],
-    blueprint: &Option<Box<dyn SegmentAggregationCollector>>,
-    limit: u32,
 ) -> crate::Result<()> {
     // we still have room for buckets, just insert
-    if (buckets.size() as u32) < limit {
+    if (buckets.size() as u32) < composite_agg_data.req.size {
         buckets
-            .get_or_insert_with(key, || CompositeBucketCollector::new(blueprint.clone()))
-            .collect(doc_id, sub_aggregation)?;
+            .get_or_insert_with(key, || {
+                CompositeBucketCollector::new(composite_agg_data.sub_aggregation_blueprint.clone())
+            })
+            .collect(doc_id, agg_data)?;
         return Ok(());
     }
 
     // map is full, but we can still update the bucket if it already exists
     if let Some(entry) = buckets.get_mut(key) {
-        entry.collect(doc_id, sub_aggregation)?;
+        entry.collect(doc_id, agg_data)?;
         return Ok(());
     }
 
@@ -476,8 +478,12 @@ fn collect_bucket_with_limit(
         if key < highest_key {
             buckets.evict_highest();
             buckets
-                .get_or_insert_with(key, || CompositeBucketCollector::new(blueprint.clone()))
-                .collect(doc_id, sub_aggregation)?;
+                .get_or_insert_with(key, || {
+                    CompositeBucketCollector::new(
+                        composite_agg_data.sub_aggregation_blueprint.clone(),
+                    )
+                })
+                .collect(doc_id, agg_data)?;
         }
     }
 
@@ -486,8 +492,7 @@ fn collect_bucket_with_limit(
 
 fn resolve_key(
     internal_key: &[InternalValueRepr],
-    sources: &[CompositeAggregationSource],
-    agg_with_accessor: &AggregationWithAccessor,
+    agg_data: &CompositeAggReqData,
 ) -> crate::Result<Vec<Option<IntermediateKey>>> {
     internal_key
         .into_iter()
@@ -495,8 +500,8 @@ fn resolve_key(
         .map(|(idx, val)| {
             resolve_internal_value_repr(
                 *val,
-                &sources[idx],
-                &agg_with_accessor.composite_accessors[idx],
+                &agg_data.req.sources[idx],
+                &agg_data.composite_accessors[idx],
             )
         })
         .collect()
@@ -577,29 +582,25 @@ fn resolve_internal_value_repr(
 /// and update the buckets.
 fn recursive_key_visitor(
     doc_id: crate::DocId,
-    blueprint: &Option<Box<dyn SegmentAggregationCollector>>,
-    limit: u32,
-    sub_aggregation: &mut AggregationsWithAccessor,
-    accessors: &[Vec<CompositeAccessor>],
-    sources: &[CompositeAggregationSource],
+    agg_data: &mut AggregationsSegmentCtx,
+    composite_agg_data: &CompositeAggReqData,
+    source_offset: usize,
     sub_level_values: &mut SmallVec<[InternalValueRepr; MAX_DYN_ARRAY_SIZE]>,
     buckets: &mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
 ) -> crate::Result<()> {
-    if accessors.is_empty() {
+    if source_offset == composite_agg_data.req.sources.len() {
         collect_bucket_with_limit(
             doc_id,
-            sub_aggregation,
+            agg_data,
+            composite_agg_data,
             buckets,
             sub_level_values,
-            blueprint,
-            limit,
         )?;
         return Ok(());
     }
-    let current_level_accessor = &accessors[0];
-    let current_level_source = &sources[0];
-    let sub_level_accessors = &accessors[1..];
-    let sub_level_sources = &sources[1..];
+
+    let current_level_accessor = &composite_agg_data.composite_accessors[source_offset];
+    let current_level_source = &composite_agg_data.req.sources[source_offset];
     let mut missing = true;
     for (i, accessor) in current_level_accessor.iter().enumerate() {
         // TODO: optimize with prefetching using fetch_block
@@ -615,11 +616,9 @@ fn recursive_key_visitor(
                     ));
                     recursive_key_visitor(
                         doc_id,
-                        blueprint,
-                        limit,
-                        sub_aggregation,
-                        sub_level_accessors,
-                        sub_level_sources,
+                        agg_data,
+                        composite_agg_data,
+                        source_offset + 1,
                         sub_level_values,
                         buckets,
                     )?;
@@ -644,17 +643,38 @@ fn recursive_key_visitor(
 
         recursive_key_visitor(
             doc_id,
-            blueprint,
-            limit,
-            sub_aggregation,
-            sub_level_accessors,
-            sub_level_sources,
+            agg_data,
+            composite_agg_data,
+            source_offset + 1,
             sub_level_values,
             buckets,
         )?;
         sub_level_values.pop();
     }
     Ok(())
+}
+
+/// Contains all information required by the [SegmentCompositeCollector] to perform the
+/// composite aggregation on a segment.
+pub struct CompositeAggReqData {
+    /// Note: sub_aggregation_blueprint is filled later when building collectors
+    pub sub_aggregation_blueprint: Option<Box<dyn SegmentAggregationCollector>>,
+    /// The name of the aggregation.
+    pub name: String,
+    /// The normalized term aggregation request.
+    pub req: CompositeAggregation,
+    /// Accessors for each source, each source can have multiple accessors (columns).
+    pub composite_accessors: Vec<Vec<CompositeAccessor>>,
+}
+
+/// Accessors for a single column in a composite source.
+pub struct CompositeAccessor {
+    /// The fast field column
+    pub column: Column<u64>,
+    /// The column type
+    pub column_type: ColumnType,
+    /// Term dictionary if the column type is Str
+    pub str_dict_column: Option<StrColumn>,
 }
 
 #[cfg(test)]
