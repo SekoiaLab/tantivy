@@ -1,29 +1,19 @@
+mod calendar_interval;
+mod collector;
 mod map;
 
 use std::cmp::Ordering;
 use std::fmt::Debug;
-use std::net::Ipv6Addr;
 
-use columnar::column_values::CompactSpaceU64Accessor;
-use columnar::{
-    Column, ColumnType, Dictionary, MonotonicallyMappableToU128, MonotonicallyMappableToU64,
-    NumericalValue, StrColumn,
-};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 
-use crate::aggregation::agg_data::{
-    build_segment_agg_collectors, AggRefNode, AggregationsSegmentCtx,
+pub use crate::aggregation::bucket::composite::collector::{
+    CompositeAccessor, CompositeAggReqData, PrecomputedDateInterval, SegmentCompositeCollector,
 };
-use crate::aggregation::bucket::composite::map::{DynArrayHeapMap, MAX_DYN_ARRAY_SIZE};
 use crate::aggregation::bucket::Order;
-use crate::aggregation::format_date;
-use crate::aggregation::intermediate_agg_result::{
-    IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
-    IntermediateCompositeBucketEntry, IntermediateCompositeBucketResult, IntermediateKey,
-};
-use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
+use crate::aggregation::deserialize_f64;
+use crate::aggregation::intermediate_agg_result::IntermediateKey;
 use crate::TantivyError;
 
 /// The position of missing keys in the ordering
@@ -37,38 +27,6 @@ pub enum MissingOrder {
     First,
     /// Missing keys should appear last
     Last,
-}
-
-/// Determine the ordering between potentially missing intermediate keys
-pub(crate) fn composite_ordering(
-    left_opt: &Option<IntermediateKey>,
-    right_opt: &Option<IntermediateKey>,
-    order: Order,
-    missing_order: MissingOrder,
-) -> Ordering {
-    match (left_opt, right_opt) {
-        (Some(left), Some(right)) => {
-            // only floats are not totally ordered, let's not care about NaN/Inf here
-            let ord = left.partial_cmp(&right).unwrap_or(Ordering::Equal);
-            match order {
-                Order::Asc => ord,
-                Order::Desc => ord.reverse(),
-            }
-        }
-        (None, Some(_)) => match (missing_order, order) {
-            (MissingOrder::First, _) => Ordering::Less,
-            (MissingOrder::Last, _) => Ordering::Greater,
-            (MissingOrder::Default, Order::Asc) => Ordering::Less,
-            (MissingOrder::Default, Order::Desc) => Ordering::Greater,
-        },
-        (Some(_), None) => match (missing_order, order) {
-            (MissingOrder::First, _) => Ordering::Greater,
-            (MissingOrder::Last, _) => Ordering::Less,
-            (MissingOrder::Default, Order::Asc) => Ordering::Greater,
-            (MissingOrder::Default, Order::Desc) => Ordering::Less,
-        },
-        (None, None) => Ordering::Equal,
-    }
 }
 
 /// Term source for a composite aggregation
@@ -91,28 +49,99 @@ pub struct TermCompositeAggregationSource {
     pub missing_order: MissingOrder,
 }
 
+/// Histogram source for a composite aggregation
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HistogramCompositeAggregationSource {
+    /// The name used to refer to this source in the composite key
+    #[serde(skip)]
+    pub name: String,
+    /// The field to aggregate on
+    pub field: String,
+    /// The interval for the histogram. For datetime fields, this is expressed
+    /// in milliseconds.
+    #[serde(deserialize_with = "deserialize_f64")]
+    pub interval: f64,
+    /// The order for this source
+    #[serde(default = "Order::asc")]
+    pub order: Order,
+    /// Whether to create a `null` bucket for documents without value for this
+    /// field. By default documents without a value are ignored.
+    #[serde(default)]
+    pub missing_bucket: bool,
+    /// Whether missing keys should appear first or last
+    #[serde(default)]
+    pub missing_order: MissingOrder,
+}
+
+/// Calendar intervals supported for date histogram sources
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CalendarInterval {
+    /// A year between Jan 1st and Dec 31st, taking into account leap years
+    Year,
+    /// A month between the 1st and the last day of the month
+    Month,
+    /// A week between Monday and Sunday
+    Week,
+}
+
+/// Date histogram source for a composite aggregation
+///
+/// Time zone not supported yet. Every interval is aligned on UTC.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DateHistogramCompositeAggregationSource {
+    /// The name used to refer to this source in the composite key
+    #[serde(skip)]
+    pub name: String,
+    /// The field to aggregate on
+    pub field: String,
+    /// The fixed interval for the histogram. Either this or `calendar_interval`
+    /// must be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_interval: Option<String>,
+    /// The calendar adjusted interval for the histogram. Either this or
+    /// `fixed_interval` must be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_interval: Option<CalendarInterval>,
+    /// The order for this source
+    #[serde(default = "Order::asc")]
+    pub order: Order,
+    /// Whether to create a `null` bucket for documents without value for this
+    /// field. By default documents without a value are ignored. Not supported
+    /// in Elasticsearch.
+    #[serde(default)]
+    pub missing_bucket: bool,
+    /// Whether missing keys should appear first or last
+    #[serde(default)]
+    pub missing_order: MissingOrder,
+}
+
 /// Source for the composite aggregation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompositeAggregationSource {
     /// Terms source
     Terms(TermCompositeAggregationSource),
-    // /// Histogram source
-    // Histogram { field: String, interval: f64 },
-    // /// Date histogram source
-    // DateHistogram { field: String, fixed_interval: Option<String>, },
+    /// Histogram source
+    Histogram(HistogramCompositeAggregationSource),
+    /// Date histogram source
+    DateHistogram(DateHistogramCompositeAggregationSource),
 }
 
 impl CompositeAggregationSource {
     pub(crate) fn field(&self) -> &str {
         match self {
-            CompositeAggregationSource::Terms(term_source) => &term_source.field,
+            CompositeAggregationSource::Terms(source) => &source.field,
+            CompositeAggregationSource::Histogram(source) => &source.field,
+            CompositeAggregationSource::DateHistogram(source) => &source.field,
         }
     }
 
     pub(crate) fn name(&self) -> &str {
         match self {
-            CompositeAggregationSource::Terms(term_source) => &term_source.name,
+            CompositeAggregationSource::Terms(source) => &source.name,
+            CompositeAggregationSource::Histogram(source) => &source.name,
+            CompositeAggregationSource::DateHistogram(source) => &source.name,
         }
     }
 }
@@ -154,8 +183,14 @@ impl TryFrom<CompositeAggregationSerde> for CompositeAggregation {
             }
             let (name, mut source) = map.into_iter().next().unwrap();
             match &mut source {
-                CompositeAggregationSource::Terms(term_source) => {
-                    term_source.name = name;
+                CompositeAggregationSource::Terms(source) => {
+                    source.name = name;
+                }
+                CompositeAggregationSource::Histogram(source) => {
+                    source.name = name;
+                }
+                CompositeAggregationSource::DateHistogram(source) => {
+                    source.name = name;
                 }
             }
             sources.push(source);
@@ -172,10 +207,18 @@ impl From<CompositeAggregation> for CompositeAggregationSerde {
         let mut serde_sources = Vec::with_capacity(value.sources.len());
         for source in value.sources {
             let (name, stored_source) = match source {
-                CompositeAggregationSource::Terms(term_source) => {
-                    let name = term_source.name.clone();
+                CompositeAggregationSource::Terms(source) => {
+                    let name = source.name.clone();
                     // name field is #[serde(skip)] so it won't be serialized inside the value
-                    (name, CompositeAggregationSource::Terms(term_source))
+                    (name, CompositeAggregationSource::Terms(source))
+                }
+                CompositeAggregationSource::Histogram(source) => {
+                    let name = source.name.clone();
+                    (name, CompositeAggregationSource::Histogram(source))
+                }
+                CompositeAggregationSource::DateHistogram(source) => {
+                    let name = source.name.clone();
+                    (name, CompositeAggregationSource::DateHistogram(source))
                 }
             };
             let mut map = FxHashMap::default();
@@ -189,505 +232,63 @@ impl From<CompositeAggregation> for CompositeAggregationSerde {
     }
 }
 
-#[derive(Clone, Debug)]
-struct CompositeBucketCollector {
-    count: u32,
-    sub_aggs: Option<Box<dyn SegmentAggregationCollector>>,
-}
-
-impl CompositeBucketCollector {
-    fn new(sub_aggs: Option<Box<dyn SegmentAggregationCollector>>) -> Self {
-        CompositeBucketCollector { count: 0, sub_aggs }
-    }
-    #[inline]
-    fn collect(
-        &mut self,
-        doc: crate::DocId,
-        agg_data: &mut AggregationsSegmentCtx,
-    ) -> crate::Result<()> {
-        self.count += 1;
-        if let Some(sub_aggs) = &mut self.sub_aggs {
-            sub_aggs.collect(doc, agg_data)?;
-        }
-        Ok(())
-    }
-}
-
-/// The value is represented as a tuple of:
-/// - the column index or missing value sentinel
-///   - if the value is present, store the accessor index + 1
-///   - if the value is missing, store 0 (for missing first) or u8::MAX (for missing last)
-/// - the fast field value u64 representation
-///   - 0 if the field is missing
-///   - regular u64 repr if the ordering is ascending
-///   - bitwise NOT of the u64 repr if the ordering is descending
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
-struct InternalValueRepr(u8, u64);
-
-impl InternalValueRepr {
-    #[inline]
-    fn new(raw: u64, accessor_idx: u8, order: Order) -> Self {
-        match order {
-            Order::Asc => InternalValueRepr(accessor_idx + 1, raw),
-            Order::Desc => InternalValueRepr(accessor_idx + 1, !raw),
-        }
-    }
-    #[inline]
-    fn new_missing(order: Order, missing_order: MissingOrder) -> Self {
-        let column_idx = match (missing_order, order) {
-            (MissingOrder::First, _) => 0,
-            (MissingOrder::Last, _) => u8::MAX,
-            (MissingOrder::Default, Order::Asc) => 0,
-            (MissingOrder::Default, Order::Desc) => u8::MAX,
-        };
-        InternalValueRepr(column_idx, 0)
-    }
-    #[inline]
-    fn decode(self, order: Order) -> Option<(u8, u64)> {
-        if self.0 == u8::MAX || self.0 == 0 {
-            return None;
-        }
-        match order {
-            Order::Asc => Some((self.0 - 1, self.1)),
-            Order::Desc => Some((self.0 - 1, !self.1)),
-        }
-    }
-}
-
-/// The collector puts values from the fast field into the correct buckets and
-/// does a conversion to the correct datatype.
-#[derive(Clone, Debug)]
-pub struct SegmentCompositeCollector {
-    buckets: DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
-    accessor_idx: usize,
-}
-
-impl SegmentAggregationCollector for SegmentCompositeCollector {
-    fn add_intermediate_aggregation_result(
-        self: Box<Self>,
-        agg_data: &AggregationsSegmentCtx,
-        results: &mut IntermediateAggregationResults,
-    ) -> crate::Result<()> {
-        let name = agg_data
-            .get_composite_req_data(self.accessor_idx)
-            .name
-            .clone();
-
-        let buckets = self.into_intermediate_bucket_result(agg_data)?;
-        results.push(
-            name,
-            IntermediateAggregationResult::Bucket(IntermediateBucketResult::Composite { buckets }),
-        )?;
-
-        Ok(())
-    }
-
-    #[inline]
-    fn collect(
-        &mut self,
-        doc: crate::DocId,
-        agg_data: &mut AggregationsSegmentCtx,
-    ) -> crate::Result<()> {
-        self.collect_block(&[doc], agg_data)
-    }
-
-    #[inline]
-    fn collect_block(
-        &mut self,
-        docs: &[crate::DocId],
-        agg_data: &mut AggregationsSegmentCtx,
-    ) -> crate::Result<()> {
-        let mem_pre = self.get_memory_consumption();
-        let composite_agg_data = agg_data.take_composite_req_data(self.accessor_idx);
-
-        for doc in docs {
-            let mut sub_level_values = SmallVec::new();
-            recursive_key_visitor(
-                *doc,
-                agg_data,
-                &composite_agg_data,
-                0,
-                &mut sub_level_values,
-                &mut self.buckets,
-            )?;
-        }
-        agg_data.put_back_composite_req_data(self.accessor_idx, composite_agg_data);
-
-        let mem_delta = self.get_memory_consumption() - mem_pre;
-        if mem_delta > 0 {
-            agg_data.limits.add_memory_consumed(mem_delta)?;
-        }
-
-        Ok(())
-    }
-
-    fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {
-        for sub_agg_collector in self.buckets.values_mut() {
-            if let Some(sub_aggs_collector) = &mut sub_agg_collector.sub_aggs {
-                sub_aggs_collector.flush(agg_data)?;
+/// Calculates the ordering between (potentially missing) intermediate keys
+pub fn composite_ordering(
+    left_opt: &Option<IntermediateKey>,
+    right_opt: &Option<IntermediateKey>,
+    order: Order,
+    missing_order: MissingOrder,
+) -> Ordering {
+    match (left_opt, right_opt) {
+        (Some(left), Some(right)) => {
+            // only floats are not totally ordered, let's not care about NaN/Inf here
+            let ord = left.partial_cmp(&right).unwrap_or(Ordering::Equal);
+            match order {
+                Order::Asc => ord,
+                Order::Desc => ord.reverse(),
             }
         }
-        Ok(())
+        (None, Some(_)) => match (missing_order, order) {
+            (MissingOrder::First, _) => Ordering::Less,
+            (MissingOrder::Last, _) => Ordering::Greater,
+            (MissingOrder::Default, Order::Asc) => Ordering::Less,
+            (MissingOrder::Default, Order::Desc) => Ordering::Greater,
+        },
+        (Some(_), None) => match (missing_order, order) {
+            (MissingOrder::First, _) => Ordering::Greater,
+            (MissingOrder::Last, _) => Ordering::Less,
+            (MissingOrder::Default, Order::Asc) => Ordering::Greater,
+            (MissingOrder::Default, Order::Desc) => Ordering::Less,
+        },
+        (None, None) => Ordering::Equal,
     }
-}
-
-impl SegmentCompositeCollector {
-    fn get_memory_consumption(&self) -> u64 {
-        // TODO: the footprint is underestimated because we don't account for the
-        // sub-aggregations which are trait objects
-        self.buckets.memory_consumption()
-    }
-
-    fn validate(req_data: &mut AggregationsSegmentCtx, accessor_idx: usize) -> crate::Result<()> {
-        let composite_data = req_data.get_composite_req_data(accessor_idx);
-        let req = &composite_data.req;
-        if req.sources.is_empty() {
-            return Err(TantivyError::InvalidArgument(
-                "composite aggregation must have at least one source".to_string(),
-            ));
-        }
-        if req.size == 0 {
-            return Err(TantivyError::InvalidArgument(
-                "composite aggregation 'size' must be > 0".to_string(),
-            ));
-        }
-        let col_types = composite_data
-            .composite_accessors
-            .iter()
-            .map(|accessors| accessors.iter().map(|a| a.column_type).collect::<Vec<_>>());
-
-        for source_columns in col_types {
-            if source_columns.is_empty() {
-                return Err(TantivyError::InvalidArgument(
-                    "composite aggregation source must have at least one accessor".to_string(),
-                ));
-            }
-            if source_columns.len() > MAX_DYN_ARRAY_SIZE {
-                return Err(TantivyError::InvalidArgument(format!(
-                    "composite aggregation source supports maximum {MAX_DYN_ARRAY_SIZE} sources",
-                )));
-            }
-            if source_columns.contains(&ColumnType::Bytes) {
-                return Err(TantivyError::InvalidArgument(
-                    "composite aggregation does not support 'bytes' field type".to_string(),
-                ));
-            }
-            if source_columns.contains(&ColumnType::DateTime) && source_columns.len() > 1 {
-                return Err(TantivyError::InvalidArgument(
-                    "composite aggregation expects 'date' fields to have a single column"
-                        .to_string(),
-                ));
-            }
-            if source_columns.contains(&ColumnType::IpAddr) && source_columns.len() > 1 {
-                return Err(TantivyError::InvalidArgument(
-                    "composite aggregation expects 'ip' fields to have a single column".to_string(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn from_req_and_validate(
-        req_data: &mut AggregationsSegmentCtx,
-        node: &AggRefNode,
-    ) -> crate::Result<Self> {
-        Self::validate(req_data, node.idx_in_req_data)?;
-
-        let has_sub_aggregations = !node.children.is_empty();
-        let blueprint = if has_sub_aggregations {
-            let sub_aggregation = build_segment_agg_collectors(req_data, &node.children)?;
-            Some(sub_aggregation)
-        } else {
-            None
-        };
-        let composite_req_data = req_data.get_composite_req_data_mut(node.idx_in_req_data);
-        composite_req_data.sub_aggregation_blueprint = blueprint;
-
-        Ok(SegmentCompositeCollector {
-            buckets: DynArrayHeapMap::try_new(composite_req_data.req.sources.len())?,
-            accessor_idx: node.idx_in_req_data,
-        })
-    }
-
-    #[inline]
-    pub(crate) fn into_intermediate_bucket_result(
-        self,
-        agg_data: &AggregationsSegmentCtx,
-    ) -> crate::Result<IntermediateCompositeBucketResult> {
-        let mut dict: FxHashMap<Vec<Option<IntermediateKey>>, IntermediateCompositeBucketEntry> =
-            Default::default();
-        dict.reserve(self.buckets.size());
-        let composite_data = agg_data.get_composite_req_data(self.accessor_idx);
-        for (key_internal_repr, agg) in self.buckets.into_iter() {
-            let key = resolve_key(&key_internal_repr, composite_data)?;
-            let mut sub_aggregation_res = IntermediateAggregationResults::default();
-            if let Some(sub_aggs_collector) = agg.sub_aggs {
-                sub_aggs_collector
-                    .add_intermediate_aggregation_result(agg_data, &mut sub_aggregation_res)?;
-            }
-
-            dict.insert(
-                key,
-                IntermediateCompositeBucketEntry {
-                    doc_count: agg.count,
-                    sub_aggregation: sub_aggregation_res,
-                },
-            );
-        }
-
-        Ok(IntermediateCompositeBucketResult {
-            entries: dict,
-            target_size: composite_data.req.size,
-            orders: composite_data
-                .req
-                .sources
-                .iter()
-                .map(|s| match s {
-                    CompositeAggregationSource::Terms(t) => (t.order, t.missing_order),
-                })
-                .collect(),
-        })
-    }
-}
-
-fn collect_bucket_with_limit(
-    doc_id: crate::DocId,
-    agg_data: &mut AggregationsSegmentCtx,
-    composite_agg_data: &CompositeAggReqData,
-    buckets: &mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
-    key: &[InternalValueRepr],
-) -> crate::Result<()> {
-    // we still have room for buckets, just insert
-    if (buckets.size() as u32) < composite_agg_data.req.size {
-        buckets
-            .get_or_insert_with(key, || {
-                CompositeBucketCollector::new(composite_agg_data.sub_aggregation_blueprint.clone())
-            })
-            .collect(doc_id, agg_data)?;
-        return Ok(());
-    }
-
-    // map is full, but we can still update the bucket if it already exists
-    if let Some(entry) = buckets.get_mut(key) {
-        entry.collect(doc_id, agg_data)?;
-        return Ok(());
-    }
-
-    // check if the item qualfies to enter the top-k, and evict the highest if it does
-    if let Some(highest_key) = buckets.peek_highest() {
-        if key < highest_key {
-            buckets.evict_highest();
-            buckets
-                .get_or_insert_with(key, || {
-                    CompositeBucketCollector::new(
-                        composite_agg_data.sub_aggregation_blueprint.clone(),
-                    )
-                })
-                .collect(doc_id, agg_data)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn resolve_key(
-    internal_key: &[InternalValueRepr],
-    agg_data: &CompositeAggReqData,
-) -> crate::Result<Vec<Option<IntermediateKey>>> {
-    internal_key
-        .into_iter()
-        .enumerate()
-        .map(|(idx, val)| {
-            resolve_internal_value_repr(
-                *val,
-                &agg_data.req.sources[idx],
-                &agg_data.composite_accessors[idx],
-            )
-        })
-        .collect()
-}
-
-fn resolve_internal_value_repr(
-    internal_value_repr: InternalValueRepr,
-    source: &CompositeAggregationSource,
-    composite_accessors: &[CompositeAccessor],
-) -> crate::Result<Option<IntermediateKey>> {
-    let decoded_value_opt = match source {
-        CompositeAggregationSource::Terms(term_source) => {
-            internal_value_repr.decode(term_source.order)
-        }
-    };
-    let Some((decoded_accessor_idx, val)) = decoded_value_opt else {
-        return Ok(None);
-    };
-    let CompositeAccessor {
-        column_type,
-        str_dict_column,
-        column,
-    } = &composite_accessors[decoded_accessor_idx as usize];
-
-    let key = if *column_type == ColumnType::Str {
-        let fallback_dict = Dictionary::empty();
-        let term_dict = str_dict_column
-            .as_ref()
-            .map(|el| el.dictionary())
-            .unwrap_or_else(|| &fallback_dict);
-
-        // TODO try use sorted_ords_to_term_cb to batch
-        let mut buffer = Vec::new();
-        term_dict.ord_to_term(val, &mut buffer)?;
-        IntermediateKey::Str(
-            String::from_utf8(buffer.to_vec()).expect("could not convert to String"),
-        )
-    } else if *column_type == ColumnType::DateTime {
-        let val = i64::from_u64(val);
-        let date = format_date(val)?;
-        IntermediateKey::Str(date)
-    } else if *column_type == ColumnType::Bool {
-        let val = bool::from_u64(val);
-        IntermediateKey::Bool(val)
-    } else if *column_type == ColumnType::IpAddr {
-        let compact_space_accessor = column
-            .values
-            .clone()
-            .downcast_arc::<CompactSpaceU64Accessor>()
-            .map_err(|_| {
-                TantivyError::AggregationError(crate::aggregation::AggregationError::InternalError(
-                    "Type mismatch: Could not downcast to CompactSpaceU64Accessor".to_string(),
-                ))
-            })?;
-        let val: u128 = compact_space_accessor.compact_to_u128(val as u32);
-        let val = Ipv6Addr::from_u128(val);
-        IntermediateKey::IpAddr(val)
-    } else {
-        if *column_type == ColumnType::U64 {
-            IntermediateKey::U64(val)
-        } else if *column_type == ColumnType::I64 {
-            IntermediateKey::I64(i64::from_u64(val))
-        } else {
-            let val = f64::from_u64(val);
-            let val: NumericalValue = val.into();
-
-            match val.normalize() {
-                NumericalValue::U64(val) => IntermediateKey::U64(val),
-                NumericalValue::I64(val) => IntermediateKey::I64(val),
-                NumericalValue::F64(val) => IntermediateKey::F64(val),
-            }
-        }
-    };
-    Ok(Some(key))
-}
-
-/// Depth-first walk of the accessors to build the composite key combinations
-/// and update the buckets.
-fn recursive_key_visitor(
-    doc_id: crate::DocId,
-    agg_data: &mut AggregationsSegmentCtx,
-    composite_agg_data: &CompositeAggReqData,
-    source_offset: usize,
-    sub_level_values: &mut SmallVec<[InternalValueRepr; MAX_DYN_ARRAY_SIZE]>,
-    buckets: &mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
-) -> crate::Result<()> {
-    if source_offset == composite_agg_data.req.sources.len() {
-        collect_bucket_with_limit(
-            doc_id,
-            agg_data,
-            composite_agg_data,
-            buckets,
-            sub_level_values,
-        )?;
-        return Ok(());
-    }
-
-    let current_level_accessor = &composite_agg_data.composite_accessors[source_offset];
-    let current_level_source = &composite_agg_data.req.sources[source_offset];
-    let mut missing = true;
-    for (i, accessor) in current_level_accessor.iter().enumerate() {
-        // TODO: optimize with prefetching using fetch_block
-        let values = accessor.column.values_for_doc(doc_id);
-        match current_level_source {
-            CompositeAggregationSource::Terms(term_source) => {
-                for value in values {
-                    missing = false;
-                    sub_level_values.push(InternalValueRepr::new(
-                        value,
-                        i as u8,
-                        term_source.order,
-                    ));
-                    recursive_key_visitor(
-                        doc_id,
-                        agg_data,
-                        composite_agg_data,
-                        source_offset + 1,
-                        sub_level_values,
-                        buckets,
-                    )?;
-                    sub_level_values.pop();
-                }
-            }
-        }
-    }
-    if missing {
-        match current_level_source {
-            CompositeAggregationSource::Terms(term_source) => {
-                if term_source.missing_bucket == false {
-                    // missing bucket not requested, skip this branch
-                    return Ok(());
-                }
-                sub_level_values.push(InternalValueRepr::new_missing(
-                    term_source.order,
-                    term_source.missing_order,
-                ));
-            }
-        }
-
-        recursive_key_visitor(
-            doc_id,
-            agg_data,
-            composite_agg_data,
-            source_offset + 1,
-            sub_level_values,
-            buckets,
-        )?;
-        sub_level_values.pop();
-    }
-    Ok(())
-}
-
-/// Contains all information required by the [SegmentCompositeCollector] to perform the
-/// composite aggregation on a segment.
-pub struct CompositeAggReqData {
-    /// Note: sub_aggregation_blueprint is filled later when building collectors
-    pub sub_aggregation_blueprint: Option<Box<dyn SegmentAggregationCollector>>,
-    /// The name of the aggregation.
-    pub name: String,
-    /// The normalized term aggregation request.
-    pub req: CompositeAggregation,
-    /// Accessors for each source, each source can have multiple accessors (columns).
-    pub composite_accessors: Vec<Vec<CompositeAccessor>>,
-}
-
-/// Accessors for a single column in a composite source.
-pub struct CompositeAccessor {
-    /// The fast field column
-    pub column: Column<u64>,
-    /// The column type
-    pub column_type: ColumnType,
-    /// Term dictionary if the column type is Str
-    pub str_dict_column: Option<StrColumn>,
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use common::DateTime;
     use serde_json::json;
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
 
     use crate::aggregation::agg_req::Aggregations;
     use crate::aggregation::tests::exec_request;
     use crate::schema::{Schema, FAST, STRING};
     use crate::Index;
+
+    fn datetime_from_iso_str(date_str: &str) -> common::DateTime {
+        let dt = OffsetDateTime::parse(date_str, &Rfc3339)
+            .expect(&format!("Failed to parse date: {}", date_str));
+        let timestamp_secs = dt.unix_timestamp_nanos();
+        common::DateTime::from_timestamp_nanos(timestamp_secs as i64)
+    }
+
+    fn ms_timestamp_from_iso_str(date_str: &str) -> i64 {
+        let dt = OffsetDateTime::parse(date_str, &Rfc3339)
+            .expect(&format!("Failed to parse date: {}", date_str));
+        (dt.unix_timestamp_nanos() / 1_000_000) as i64
+    }
 
     fn composite_aggregation_test(merge_segments: bool) -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
@@ -1329,15 +930,15 @@ mod tests {
         let index = Index::create_in_ram(schema_builder.build());
         {
             let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
-            // Add documents with different dates (string timestamps)
+            // Add documents with different dates
             index_writer
-                .add_document(doc!(date_field => DateTime::from_timestamp_secs(1609459200)))?; // 2021-01-01
+                .add_document(doc!(date_field => datetime_from_iso_str("2021-01-01T00:00:00Z")))?;
             index_writer
-                .add_document(doc!(date_field => DateTime::from_timestamp_secs(1640995200)))?; // 2022-01-01
+                .add_document(doc!(date_field => datetime_from_iso_str("2022-01-01T00:00:00Z")))?;
             index_writer
-                .add_document(doc!(date_field => DateTime::from_timestamp_secs(1609459200)))?; // 2021 duplicate
+                .add_document(doc!(date_field => datetime_from_iso_str("2021-01-01T00:00:00Z")))?; // duplicate
             index_writer
-                .add_document(doc!(date_field => DateTime::from_timestamp_secs(1672531200)))?; // 2023-01-01
+                .add_document(doc!(date_field => datetime_from_iso_str("2023-01-01T00:00:00Z")))?;
             index_writer.commit()?;
         }
 
@@ -1433,6 +1034,7 @@ mod tests {
             index_writer.add_document(doc!(score_field => 1.0f64, string_field => "apple"))?;
             index_writer.add_document(doc!(score_field => 2.0f64, string_field => "banana"))?;
             index_writer.add_document(doc!(score_field => 3.0f64, string_field => "cherry"))?;
+            index_writer.add_document(doc!(score_field => 1.0f64, string_field => "banana"))?;
             index_writer.commit()?;
         }
 
@@ -1449,18 +1051,17 @@ mod tests {
             }
         }))
         .unwrap();
-
         let res = exec_request(agg_req, &index)?;
         let buckets = &res["my_composite"]["buckets"];
-
-        // Should handle mixed types correctly
-        assert!(buckets.as_array().unwrap().len() > 0);
-
-        // Check that keys contain both string and numeric values
-        for bucket in buckets.as_array().unwrap() {
-            assert!(bucket["key"]["category"].is_string());
-            assert!(bucket["key"]["score"].is_number());
-        }
+        assert_eq!(
+            buckets,
+            &json!([
+                {"key": {"category": "apple", "score": 1}, "doc_count": 2},
+                {"key": {"category": "banana", "score": 2}, "doc_count": 2},
+                {"key": {"category": "banana", "score": 1}, "doc_count": 1},
+                {"key": {"category": "cherry", "score": 3}, "doc_count": 1}
+            ])
+        );
 
         Ok(())
     }
@@ -1500,11 +1101,8 @@ mod tests {
             }
         }))
         .unwrap();
-
         let res = exec_request(agg_req, &index)?;
         let buckets = &res["my_composite"]["buckets"];
-
-        // Verify buckets with mixed types (booleans stored as numbers 0/1)
         assert_eq!(
             buckets,
             &json!([
@@ -1549,10 +1147,8 @@ mod tests {
             }
         }))
         .unwrap();
-
         let res = exec_request(agg_req, &index)?;
         let buckets = &res["my_composite"]["buckets"];
-
         assert_eq!(
             buckets,
             &json!([
@@ -1601,10 +1197,8 @@ mod tests {
             }
         }))
         .unwrap();
-
         let res = exec_request(agg_req, &index)?;
         let buckets = &res["my_composite"]["buckets"];
-
         assert_eq!(
             buckets,
             &json!([
@@ -1635,7 +1229,6 @@ mod tests {
             index_writer.commit()?;
         }
 
-        // Test ascending order - let's first see what we get
         let agg_req: Aggregations = serde_json::from_value(json!({
             "my_composite": {
                 "composite": {
@@ -1647,11 +1240,8 @@ mod tests {
             }
         }))
         .unwrap();
-
         let res = exec_request(agg_req, &index)?;
         let buckets = &res["my_composite"]["buckets"];
-
-        // In ascending order: booleans, numbers, then strings
         assert_eq!(
             buckets,
             &json!([
@@ -1677,11 +1267,8 @@ mod tests {
             }
         }))
         .unwrap();
-
         let res = exec_request(agg_req, &index)?;
         let buckets = &res["my_composite"]["buckets"];
-
-        // In descending order
         assert_eq!(
             buckets,
             &json!([
@@ -1695,6 +1282,272 @@ mod tests {
             ])
         );
 
+        Ok(())
+    }
+
+    // TODO add test with no column match
+
+    #[test]
+    fn composite_aggregation_test_histogram_source() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let num_field = schema_builder.add_f64_field("value", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+            index_writer.add_document(doc!(num_field => 1.0f64))?;
+            index_writer.add_document(doc!(num_field => 2.0f64))?;
+            index_writer.add_document(doc!(num_field => 5.0f64))?;
+            index_writer.add_document(doc!(num_field => 7.0f64))?;
+            index_writer.add_document(doc!(num_field => 11.0f64))?;
+            index_writer.commit()?;
+        }
+
+        // Histogram with interval 5
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_composite": {
+                "composite": {
+                    "sources": [
+                        {"val_hist": {"histogram": {"field": "value", "interval": 5.0}}}
+                    ],
+                    "size": 10
+                }
+            }
+        }))
+        .unwrap();
+        let res = exec_request(agg_req, &index)?;
+        let buckets = &res["my_composite"]["buckets"];
+        assert_eq!(
+            buckets,
+            &json!([
+                {"key": {"val_hist": 0.0}, "doc_count": 2},
+                {"key": {"val_hist": 5.0}, "doc_count": 2},
+                {"key": {"val_hist": 10.0}, "doc_count": 1}
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_aggregation_test_date_histogram_calendar_source() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let date_field = schema_builder.add_date_field("dt", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+            index_writer
+                .add_document(doc!(date_field => datetime_from_iso_str("2021-01-01T00:00:00Z")))?;
+            index_writer
+                .add_document(doc!(date_field => datetime_from_iso_str("2021-02-01T00:00:00Z")))?;
+            index_writer
+                .add_document(doc!(date_field => datetime_from_iso_str("2022-01-01T00:00:00Z")))?;
+            index_writer
+                .add_document(doc!(date_field => datetime_from_iso_str("2023-01-01T00:00:00Z")))?;
+            index_writer.commit()?;
+        }
+
+        // Date histogram with calendar_interval = "year"
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_composite": {
+                "composite": {
+                    "sources": [
+                        {"dt_hist": {"date_histogram": {"field": "dt", "calendar_interval": "year"}}}
+                    ],
+                    "size": 10
+                }
+            }
+        })).unwrap();
+        let res = exec_request(agg_req, &index)?;
+        let buckets = &res["my_composite"]["buckets"];
+        assert_eq!(
+            buckets,
+            &json!([
+                {"key": {"dt_hist": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z")}, "doc_count": 2},
+                {"key": {"dt_hist": ms_timestamp_from_iso_str("2022-01-01T00:00:00Z")}, "doc_count": 1},
+                {"key": {"dt_hist": ms_timestamp_from_iso_str("2023-01-01T00:00:00Z")}, "doc_count": 1}
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_aggregation_test_date_histogram_fixed_interval() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let date_field = schema_builder.add_date_field("dt", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+            index_writer
+                .add_document(doc!(date_field => datetime_from_iso_str("2021-01-01T00:00:00Z")))?;
+            index_writer
+                .add_document(doc!(date_field => datetime_from_iso_str("2021-01-01T05:30:00Z")))?;
+            index_writer
+                .add_document(doc!(date_field => datetime_from_iso_str("2021-01-01T06:00:00Z")))?;
+            index_writer
+                .add_document(doc!(date_field => datetime_from_iso_str("2021-01-01T12:00:00Z")))?;
+            index_writer
+                .add_document(doc!(date_field => datetime_from_iso_str("2021-01-01T18:00:00Z")))?;
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_composite": {
+                "composite": {
+                    "sources": [
+                        {"dt_hist": {"date_histogram": {"field": "dt", "fixed_interval": "6h"}}}
+                    ],
+                    "size": 10
+                }
+            }
+        }))
+        .unwrap();
+        let res = exec_request(agg_req, &index)?;
+        let buckets = &res["my_composite"]["buckets"];
+        assert_eq!(
+            buckets,
+            &json!([
+                {"key": {"dt_hist": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z")}, "doc_count": 2},
+                {"key": {"dt_hist": ms_timestamp_from_iso_str("2021-01-01T06:00:00Z")}, "doc_count": 1},
+                {"key": {"dt_hist": ms_timestamp_from_iso_str("2021-01-01T12:00:00Z")}, "doc_count": 1},
+                {"key": {"dt_hist": ms_timestamp_from_iso_str("2021-01-01T18:00:00Z")}, "doc_count": 1}
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composite_aggregation_test_mixed_term_and_date_histogram() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let date_field = schema_builder.add_date_field("timestamp", FAST);
+        let category_field = schema_builder.add_text_field("category", STRING | FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+            index_writer.add_document(doc!(
+                date_field => datetime_from_iso_str("2021-01-01T05:00:00Z"),
+                category_field => "electronics"
+            ))?;
+            index_writer.add_document(doc!(
+                date_field => datetime_from_iso_str("2021-01-15T10:30:00Z"),
+                category_field => "electronics"
+            ))?;
+            index_writer.add_document(doc!(
+                date_field => datetime_from_iso_str("2021-01-05T12:00:00Z"),
+                category_field => "books"
+            ))?;
+            index_writer.add_document(doc!(
+                date_field => datetime_from_iso_str("2021-02-10T08:45:00Z"),
+                category_field => "books"
+            ))?;
+            index_writer.add_document(doc!(
+                date_field => datetime_from_iso_str("2021-02-05T14:20:00Z"),
+                category_field => "clothing"
+            ))?;
+            index_writer.add_document(doc!(
+                date_field => datetime_from_iso_str("2021-02-20T09:15:00Z"),
+                category_field => "clothing"
+            ))?;
+
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_composite": {
+                "composite": {
+                    "sources": [
+                        {"category": {"terms": {"field": "category"}}},
+                        {"month": {"date_histogram": {"field": "timestamp", "calendar_interval": "month"}}}
+                    ],
+                    "size": 10
+                }
+            }
+        }))
+        .unwrap();
+        let res = exec_request(agg_req, &index)?;
+        let buckets = &res["my_composite"]["buckets"];
+        assert_eq!(
+            buckets,
+            &json!([
+                {"key": {"category": "books", "month": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z")}, "doc_count": 1},
+                {"key": {"category": "books", "month": ms_timestamp_from_iso_str("2021-02-01T00:00:00Z")}, "doc_count": 1},
+                {"key": {"category": "clothing", "month": ms_timestamp_from_iso_str("2021-02-01T00:00:00Z")}, "doc_count": 2},
+                {"key": {"category": "electronics", "month": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z")}, "doc_count": 2}
+            ])
+        );
+
+        // Test with different ordering for sources with a size limit
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_composite": {
+                "composite": {
+                    "sources": [
+                        {"month": {"date_histogram": {"field": "timestamp", "calendar_interval": "month"}}},
+                        {"category": {"terms": {"field": "category", "order": "desc"}}}
+                    ],
+                    "size": 3
+                }
+            }
+        }))
+        .unwrap();
+        let res = exec_request(agg_req, &index)?;
+        let buckets = &res["my_composite"]["buckets"];
+        assert_eq!(
+            buckets,
+            &json!([
+                {"key": {"month": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z"), "category": "electronics"}, "doc_count": 2},
+                {"key": {"month": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z"), "category": "books"}, "doc_count": 1},
+                {"key": {"month": ms_timestamp_from_iso_str("2021-02-01T00:00:00Z"), "category": "clothing"}, "doc_count": 2},
+            ])
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn composite_aggregation_test_no_matching_columns() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let date_field = schema_builder.add_f64_field("dt", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+            index_writer.add_document(doc!(date_field => 1.0))?;
+            index_writer.add_document(doc!(date_field => 2.0))?;
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_composite": {
+                "composite": {
+                    "sources": [
+                        {"dt_hist": {"date_histogram": {"field": "dt", "fixed_interval": "6h"}}}
+                    ],
+                    "size": 10
+                }
+            }
+        }))
+        .unwrap();
+        let res = exec_request(agg_req, &index)?;
+        let buckets = &res["my_composite"]["buckets"];
+        assert_eq!(buckets, &json!([]));
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_composite": {
+                "composite": {
+                    "sources": [
+                        {"dt_hist": {"date_histogram": {"field": "dt", "fixed_interval": "6h", "missing_bucket": true}}}
+                    ],
+                    "size": 10,
+                }
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index)?;
+        let buckets = &res["my_composite"]["buckets"];
+
+        assert_eq!(
+            buckets,
+            &json!([{"key": {"dt_hist": null}, "doc_count": 2}])
+        );
         Ok(())
     }
 }

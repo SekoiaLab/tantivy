@@ -8,8 +8,8 @@ use crate::aggregation::agg_req_with_accessor::{
 };
 use crate::aggregation::bucket::{
     CompositeAccessor, CompositeAggReqData, CompositeAggregation, CompositeAggregationSource,
-    HistogramAggReqData, HistogramBounds, MissingTermAggReqData, Order, RangeAggReqData,
-    SegmentCompositeCollector, SegmentHistogramCollector, SegmentRangeCollector,
+    HistogramAggReqData, HistogramBounds, MissingTermAggReqData, Order, PrecomputedDateInterval,
+    RangeAggReqData, SegmentCompositeCollector, SegmentHistogramCollector, SegmentRangeCollector,
     SegmentTermCollector, TermMissingAgg, TermsAggReqData, TermsAggregation,
     TermsAggregationInternal,
 };
@@ -507,6 +507,7 @@ fn build_nodes(
                 field_type,
                 column_block_accessor: Default::default(),
                 name: agg_name.to_string(),
+                // will be filled later when building collectors
                 sub_aggregation_blueprint: None,
                 req: histo_req.clone(),
                 is_date_histogram: false,
@@ -534,6 +535,7 @@ fn build_nodes(
                 field_type,
                 column_block_accessor: Default::default(),
                 name: agg_name.to_string(),
+                // will be filled later when building collectors
                 sub_aggregation_blueprint: None,
                 req: histo_req,
                 is_date_histogram: true,
@@ -886,22 +888,22 @@ fn build_composite_node(
     sub_aggs: &Aggregations,
     req: &CompositeAggregation,
 ) -> crate::Result<AggRefNode> {
-    let allowed_column_types = [
-        ColumnType::I64,
-        ColumnType::U64,
-        ColumnType::F64,
-        ColumnType::Str,
-        ColumnType::DateTime,
-        ColumnType::Bool,
-        ColumnType::IpAddr,
-        // ColumnType::Bytes Unsupported
-    ];
     let mut composite_accessors = Vec::with_capacity(req.sources.len());
     for source in &req.sources {
         match source {
-            CompositeAggregationSource::Terms(terms_source) => {
+            CompositeAggregationSource::Terms(source) => {
+                let allowed_column_types = [
+                    ColumnType::I64,
+                    ColumnType::U64,
+                    ColumnType::F64,
+                    ColumnType::Str,
+                    ColumnType::DateTime,
+                    ColumnType::Bool,
+                    ColumnType::IpAddr,
+                    // ColumnType::Bytes Unsupported
+                ];
                 let mut column_and_types =
-                    get_all_ff_readers(reader, &terms_source.field, Some(&allowed_column_types))?;
+                    get_all_ff_readers(reader, &source.field, Some(&allowed_column_types))?;
 
                 column_and_types.sort_by_key(|(_, col_type)| {
                     // We want the same order as IntermediateKey:
@@ -916,7 +918,7 @@ fn build_composite_node(
                         ColumnType::U64 => 6,
                         ColumnType::Bytes => panic!("unsupported"),
                     };
-                    match terms_source.order {
+                    match source.order {
                         Order::Asc => rank,
                         Order::Desc => -rank,
                     }
@@ -927,7 +929,56 @@ fn build_composite_node(
                         Ok(CompositeAccessor {
                             column,
                             column_type,
-                            str_dict_column: reader.fast_fields().str(&terms_source.field)?,
+                            str_dict_column: reader.fast_fields().str(&source.field)?,
+                            date_histogram_interval: PrecomputedDateInterval::NotApplicable,
+                        })
+                    })
+                    .collect::<crate::Result<_>>()?;
+                composite_accessors.push(source_collectors);
+            }
+            CompositeAggregationSource::Histogram(source) => {
+                let column_and_types = get_all_ff_readers(
+                    reader,
+                    &source.field,
+                    Some(get_numeric_or_date_column_types()),
+                )?;
+                debug_assert!(
+                    column_and_types.len() <= 1,
+                    "we expect at most one column for 'numeric or date' allowed type"
+                );
+                let source_collectors: Vec<CompositeAccessor> = column_and_types
+                    .into_iter()
+                    .map(|(column, column_type)| {
+                        Ok(CompositeAccessor {
+                            column,
+                            column_type,
+                            str_dict_column: None,
+                            date_histogram_interval: PrecomputedDateInterval::NotApplicable,
+                        })
+                    })
+                    .collect::<crate::Result<_>>()?;
+                composite_accessors.push(source_collectors);
+            }
+            CompositeAggregationSource::DateHistogram(source) => {
+                let column_and_types =
+                    get_all_ff_readers(reader, &source.field, Some(&[ColumnType::DateTime]))?;
+                debug_assert!(
+                    column_and_types.len() <= 1,
+                    "we expect at most one column for date type"
+                );
+                let date_histogram_interval =
+                    PrecomputedDateInterval::from_date_histogram_source_intervals(
+                        &source.fixed_interval,
+                        source.calendar_interval,
+                    )?;
+                let source_collectors: Vec<CompositeAccessor> = column_and_types
+                    .into_iter()
+                    .map(|(column, column_type)| {
+                        Ok(CompositeAccessor {
+                            column,
+                            column_type,
+                            str_dict_column: None,
+                            date_histogram_interval,
                         })
                     })
                     .collect::<crate::Result<_>>()?;
@@ -939,7 +990,7 @@ fn build_composite_node(
         name: agg_name.to_string(),
         req: req.clone(),
         composite_accessors,
-        // will be filled later when building collectors
+        // fields below will be filled later when building collectors
         sub_aggregation_blueprint: None,
     };
     let idx = data.push_composite_req_data(agg);
