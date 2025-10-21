@@ -3,12 +3,12 @@ use serde::Serialize;
 
 use crate::aggregation::agg_req::{Aggregation, AggregationVariants, Aggregations};
 use crate::aggregation::agg_req_with_accessor::{
-    get_all_ff_reader_or_empty, get_all_ff_readers, get_dynamic_columns, get_ff_reader,
-    get_missing_val_as_u64_lenient, get_numeric_or_date_column_types,
+    get_all_ff_reader_or_empty, get_dynamic_columns, get_ff_reader, get_missing_val_as_u64_lenient,
+    get_numeric_or_date_column_types,
 };
+pub use crate::aggregation::bucket::{CompositeAggReqData, CompositeSourceAccessors};
 use crate::aggregation::bucket::{
-    CompositeAccessor, CompositeAggReqData, CompositeAggregation, CompositeAggregationSource,
-    HistogramAggReqData, HistogramBounds, MissingTermAggReqData, Order, PrecomputedDateInterval,
+    CompositeAggregation, HistogramAggReqData, HistogramBounds, MissingTermAggReqData,
     RangeAggReqData, SegmentCompositeCollector, SegmentHistogramCollector, SegmentRangeCollector,
     SegmentTermCollector, TermMissingAgg, TermsAggReqData, TermsAggregation,
     TermsAggregationInternal,
@@ -890,101 +890,10 @@ fn build_composite_node(
 ) -> crate::Result<AggRefNode> {
     let mut composite_accessors = Vec::with_capacity(req.sources.len());
     for source in &req.sources {
-        match source {
-            CompositeAggregationSource::Terms(source) => {
-                let allowed_column_types = [
-                    ColumnType::I64,
-                    ColumnType::U64,
-                    ColumnType::F64,
-                    ColumnType::Str,
-                    ColumnType::DateTime,
-                    ColumnType::Bool,
-                    ColumnType::IpAddr,
-                    // ColumnType::Bytes Unsupported
-                ];
-                let mut column_and_types =
-                    get_all_ff_readers(reader, &source.field, Some(&allowed_column_types))?;
-
-                column_and_types.sort_by_key(|(_, col_type)| {
-                    // We want the same order as IntermediateKey:
-                    // IpAddr->Bool->Str->F64->I64->U64
-                    let rank = match col_type {
-                        ColumnType::IpAddr => 0,
-                        ColumnType::Bool => 1,
-                        ColumnType::Str => 2,
-                        ColumnType::DateTime => 3, // repr as IntermediateKey::Str
-                        ColumnType::F64 => 4,
-                        ColumnType::I64 => 5,
-                        ColumnType::U64 => 6,
-                        ColumnType::Bytes => panic!("unsupported"),
-                    };
-                    match source.order {
-                        Order::Asc => rank,
-                        Order::Desc => -rank,
-                    }
-                });
-                let source_collectors: Vec<CompositeAccessor> = column_and_types
-                    .into_iter()
-                    .map(|(column, column_type)| {
-                        Ok(CompositeAccessor {
-                            column,
-                            column_type,
-                            str_dict_column: reader.fast_fields().str(&source.field)?,
-                            date_histogram_interval: PrecomputedDateInterval::NotApplicable,
-                        })
-                    })
-                    .collect::<crate::Result<_>>()?;
-                composite_accessors.push(source_collectors);
-            }
-            CompositeAggregationSource::Histogram(source) => {
-                let column_and_types = get_all_ff_readers(
-                    reader,
-                    &source.field,
-                    Some(get_numeric_or_date_column_types()),
-                )?;
-                debug_assert!(
-                    column_and_types.len() <= 1,
-                    "we expect at most one column for 'numeric or date' allowed type"
-                );
-                let source_collectors: Vec<CompositeAccessor> = column_and_types
-                    .into_iter()
-                    .map(|(column, column_type)| {
-                        Ok(CompositeAccessor {
-                            column,
-                            column_type,
-                            str_dict_column: None,
-                            date_histogram_interval: PrecomputedDateInterval::NotApplicable,
-                        })
-                    })
-                    .collect::<crate::Result<_>>()?;
-                composite_accessors.push(source_collectors);
-            }
-            CompositeAggregationSource::DateHistogram(source) => {
-                let column_and_types =
-                    get_all_ff_readers(reader, &source.field, Some(&[ColumnType::DateTime]))?;
-                debug_assert!(
-                    column_and_types.len() <= 1,
-                    "we expect at most one column for date type"
-                );
-                let date_histogram_interval =
-                    PrecomputedDateInterval::from_date_histogram_source_intervals(
-                        &source.fixed_interval,
-                        source.calendar_interval,
-                    )?;
-                let source_collectors: Vec<CompositeAccessor> = column_and_types
-                    .into_iter()
-                    .map(|(column, column_type)| {
-                        Ok(CompositeAccessor {
-                            column,
-                            column_type,
-                            str_dict_column: None,
-                            date_histogram_interval,
-                        })
-                    })
-                    .collect::<crate::Result<_>>()?;
-                composite_accessors.push(source_collectors);
-            }
-        }
+        let source_after_key_opt = req.after.get(source.name());
+        let source_accessor =
+            CompositeSourceAccessors::build_for_source(reader, source, source_after_key_opt)?;
+        composite_accessors.push(source_accessor);
     }
     let agg = CompositeAggReqData {
         name: agg_name.to_string(),

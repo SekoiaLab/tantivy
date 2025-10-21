@@ -163,6 +163,9 @@ pub enum BucketResult {
         ///
         /// See [`CompositeAggregation`](super::bucket::CompositeAggregation)
         buckets: Vec<CompositeBucketEntry>,
+        /// The key to start after when paginating
+        #[serde(skip_serializing_if = "FxHashMap::is_empty")]
+        after_key: FxHashMap<String, Option<CompositeKey>>,
     },
 }
 
@@ -180,7 +183,7 @@ impl BucketResult {
                 sum_other_doc_count: _,
                 doc_count_error_upper_bound: _,
             } => buckets.iter().map(|bucket| bucket.get_bucket_count()).sum(),
-            BucketResult::Composite { buckets } => {
+            BucketResult::Composite { buckets, .. } => {
                 buckets.iter().map(|bucket| bucket.get_bucket_count()).sum()
             }
         }
@@ -320,15 +323,15 @@ impl RangeBucketEntry {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
 /// The key to identify a composite bucket.
 ///
 /// This is similar to `Key`, but composite keys can also be boolean.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompositeKey {
     /// Boolean key
     Bool(bool),
-    /// String key∂
+    /// String key
     Str(String),
     /// `i64` key
     I64(i64),

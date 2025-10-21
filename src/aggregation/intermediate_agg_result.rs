@@ -856,8 +856,8 @@ impl IntermediateCompositeBucketResult {
             trim_composite_buckets(self.entries, &self.orders, self.target_size);
         let buckets = trimmed_entry_vec
             .into_iter()
-            .map(|(keys, entry)| {
-                let key = keys
+            .map(|(intermediate_key, entry)| {
+                let key = intermediate_key
                     .into_iter()
                     .enumerate()
                     .map(|(idx, intermediate_key)| {
@@ -878,7 +878,13 @@ impl IntermediateCompositeBucketResult {
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
-        Ok(BucketResult::Composite { buckets })
+        let after_key = if buckets.len() == req.size as usize {
+            buckets.last().map(|bucket| bucket.key.clone()).unwrap()
+        } else {
+            FxHashMap::default()
+        };
+
+        Ok(BucketResult::Composite { after_key, buckets })
     }
 
     fn merge_fruits(&mut self, other: IntermediateCompositeBucketResult) -> crate::Result<()> {

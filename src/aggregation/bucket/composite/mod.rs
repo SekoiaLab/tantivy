@@ -1,3 +1,4 @@
+mod accessors;
 mod calendar_interval;
 mod collector;
 mod map;
@@ -8,9 +9,11 @@ use std::fmt::Debug;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-pub use crate::aggregation::bucket::composite::collector::{
-    CompositeAccessor, CompositeAggReqData, PrecomputedDateInterval, SegmentCompositeCollector,
+use crate::aggregation::agg_result::CompositeKey;
+pub use crate::aggregation::bucket::composite::accessors::{
+    CompositeAccessor, CompositeAggReqData, CompositeSourceAccessors, PrecomputedDateInterval,
 };
+pub use crate::aggregation::bucket::composite::collector::SegmentCompositeCollector;
 use crate::aggregation::bucket::Order;
 use crate::aggregation::deserialize_f64;
 use crate::aggregation::intermediate_agg_result::IntermediateKey;
@@ -144,6 +147,30 @@ impl CompositeAggregationSource {
             CompositeAggregationSource::DateHistogram(source) => &source.name,
         }
     }
+
+    pub(crate) fn order(&self) -> Order {
+        match self {
+            CompositeAggregationSource::Terms(source) => source.order,
+            CompositeAggregationSource::Histogram(source) => source.order,
+            CompositeAggregationSource::DateHistogram(source) => source.order,
+        }
+    }
+
+    pub(crate) fn missing_order(&self) -> MissingOrder {
+        match self {
+            CompositeAggregationSource::Terms(source) => source.missing_order,
+            CompositeAggregationSource::Histogram(source) => source.missing_order,
+            CompositeAggregationSource::DateHistogram(source) => source.missing_order,
+        }
+    }
+
+    pub(crate) fn missing_bucket(&self) -> bool {
+        match self {
+            CompositeAggregationSource::Terms(source) => source.missing_bucket,
+            CompositeAggregationSource::Histogram(source) => source.missing_bucket,
+            CompositeAggregationSource::DateHistogram(source) => source.missing_bucket,
+        }
+    }
 }
 
 /// A paginable aggregation that performs on multiple dimensions (sources),
@@ -162,12 +189,16 @@ pub struct CompositeAggregation {
     pub sources: Vec<CompositeAggregationSource>,
     /// Number of buckets to return (page size)
     pub size: u32,
+    /// The key of the last bucket from the previous page
+    pub after: FxHashMap<String, Option<CompositeKey>>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct CompositeAggregationSerde {
     sources: Vec<FxHashMap<String, CompositeAggregationSource>>,
     size: u32,
+    #[serde(default, skip_serializing_if = "FxHashMap::is_empty")]
+    after: FxHashMap<String, Option<CompositeKey>>,
 }
 
 impl TryFrom<CompositeAggregationSerde> for CompositeAggregation {
@@ -198,6 +229,7 @@ impl TryFrom<CompositeAggregationSerde> for CompositeAggregation {
         Ok(CompositeAggregation {
             sources,
             size: value.size,
+            after: value.after,
         })
     }
 }
@@ -228,6 +260,7 @@ impl From<CompositeAggregation> for CompositeAggregationSerde {
         CompositeAggregationSerde {
             sources: serde_sources,
             size: value.size,
+            after: value.after,
         }
     }
 }
@@ -290,6 +323,46 @@ mod tests {
         (dt.unix_timestamp_nanos() / 1_000_000) as i64
     }
 
+    /// Runs the query and compares the result buckets to the expected buckets,
+    /// then run the same query with all possible `after` keys.
+    fn exec_and_assert_all_paginations(
+        index: &Index,
+        composite_agg_req: serde_json::Value,
+        expected_buckets: serde_json::Value,
+    ) {
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_composite": {
+                "composite": composite_agg_req
+            }
+        }))
+        .unwrap();
+        let res = exec_request(agg_req, &index).unwrap();
+        let buckets = &res["my_composite"]["buckets"];
+        assert_eq!(buckets, &expected_buckets);
+
+        // check that all returned values can be used as after key
+        for (i, expected_bucket) in expected_buckets.as_array().unwrap().iter().enumerate() {
+            let new_composite_agg_req = json!({
+                "sources": composite_agg_req["sources"].clone(),
+                "size": composite_agg_req["size"].clone(),
+                "after": expected_bucket["key"].clone()
+            });
+            let agg_req: Aggregations = serde_json::from_value(json!({
+                "my_composite": {
+                    "composite": new_composite_agg_req
+                }
+            }))
+            .unwrap();
+            let paginated_res = exec_request(agg_req, &index).unwrap();
+            assert_eq!(
+                &paginated_res["my_composite"]["buckets"],
+                &json!(&expected_buckets.as_array().unwrap()[i + 1..]),
+                "query with after key failed: {}",
+                new_composite_agg_req.to_string()
+            );
+        }
+    }
+
     fn composite_aggregation_test(merge_segments: bool) -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let string_field = schema_builder.add_text_field("string_id", STRING | FAST);
@@ -300,6 +373,7 @@ mod tests {
             index_writer.add_document(doc!(string_field => "termb"))?;
             index_writer.add_document(doc!(string_field => "termc"))?;
             index_writer.add_document(doc!(string_field => "terma"))?;
+            index_writer.commit()?;
             index_writer.add_document(doc!(string_field => "terma"))?;
             index_writer.add_document(doc!(string_field => "terma"))?;
             index_writer.add_document(doc!(string_field => "termb"))?;
@@ -338,16 +412,16 @@ mod tests {
     }
 
     #[test]
-    fn composite_aggregation_test_single_segment() -> crate::Result<()> {
+    fn composite_aggregation_term_single_segment() -> crate::Result<()> {
         composite_aggregation_test(true)
     }
 
     #[test]
-    fn composite_aggregation_test_multi_segment() -> crate::Result<()> {
+    fn composite_aggregation_term_multi_segment() -> crate::Result<()> {
         composite_aggregation_test(false)
     }
 
-    fn composite_aggregation_test_size_limit(merge_segments: bool) -> crate::Result<()> {
+    fn composite_aggregation_term_size_limit(merge_segments: bool) -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let string_field = schema_builder.add_text_field("string_id", STRING | FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -355,6 +429,7 @@ mod tests {
             let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
             index_writer.add_document(doc!(string_field => "terma"))?;
             index_writer.add_document(doc!(string_field => "termb"))?;
+            index_writer.commit()?;
             index_writer.add_document(doc!(string_field => "termc"))?;
             index_writer.add_document(doc!(string_field => "termd"))?;
             index_writer.add_document(doc!(string_field => "terme"))?;
@@ -375,10 +450,8 @@ mod tests {
             }
         }))
         .unwrap();
-
         let res = exec_request(agg_req, &index)?;
         let buckets = &res["my_composite"]["buckets"];
-
         // Should only return 3 buckets due to size limit
         assert_eq!(
             buckets,
@@ -389,21 +462,45 @@ mod tests {
             ])
         );
 
+        // next page
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_composite": {
+                "composite": {
+                    "sources": [
+                        {"myterm": {"terms": {"field": "string_id"}}}
+                    ],
+                    "size": 3,
+                    "after":  &res["my_composite"]["after_key"]
+                }
+            }
+        }))
+        .unwrap();
+        let res = exec_request(agg_req, &index)?;
+        let buckets = &res["my_composite"]["buckets"];
+        assert_eq!(
+            buckets,
+            &json!([
+                {"key": {"myterm": "termd"}, "doc_count": 1},
+                {"key": {"myterm": "terme"}, "doc_count": 1}
+            ])
+        );
+        assert!(res["my_composite"].get("after_key").is_none());
+
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_size_limit_single_segment() -> crate::Result<()> {
-        composite_aggregation_test_size_limit(true)
+    fn composite_aggregation_term_size_limit_single_segment() -> crate::Result<()> {
+        composite_aggregation_term_size_limit(true)
     }
 
     #[test]
-    fn composite_aggregation_test_size_limit_multi_segment() -> crate::Result<()> {
-        composite_aggregation_test_size_limit(false)
+    fn composite_aggregation_term_size_limit_multi_segment() -> crate::Result<()> {
+        composite_aggregation_term_size_limit(false)
     }
 
     #[test]
-    fn composite_aggregation_test_ordering() -> crate::Result<()> {
+    fn composite_aggregation_term_ordering() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let string_field = schema_builder.add_text_field("string_id", STRING | FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -422,7 +519,7 @@ mod tests {
 
         // Test ascending order (default)
         let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
+            "fruity_aggreg": {
                 "composite": {
                     "sources": [
                         {"myterm": {"terms": {"field": "string_id", "order": "asc"}}}
@@ -432,10 +529,8 @@ mod tests {
             }
         }))
         .unwrap();
-
         let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-
+        let buckets = &res["fruity_aggreg"]["buckets"];
         // Should return only 5 buckets due to size limit, in ascending order
         assert_eq!(
             buckets,
@@ -450,7 +545,7 @@ mod tests {
 
         // Test descending order
         let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
+            "fruity_aggreg": {
                 "composite": {
                     "sources": [
                         {"myterm": {"terms": {"field": "string_id", "order": "desc"}}}
@@ -460,10 +555,8 @@ mod tests {
             }
         }))
         .unwrap();
-
         let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-
+        let buckets = &res["fruity_aggreg"]["buckets"];
         // Should return only 5 buckets due to size limit, in descending order
         assert_eq!(
             buckets,
@@ -476,11 +569,37 @@ mod tests {
             ])
         );
 
+        // next page in descending order
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "fruity_aggreg": {
+                "composite": {
+                    "sources": [
+                        {"myterm": {"terms": {"field": "string_id", "order": "desc"}}}
+                    ],
+                    "size": 5,
+                    "after":  &res["fruity_aggreg"]["after_key"]
+                }
+            }
+        }))
+        .unwrap();
+        let res = exec_request(agg_req, &index)?;
+        let buckets = &res["fruity_aggreg"]["buckets"];
+        // Should return only 5 buckets due to size limit, in descending order
+        assert_eq!(
+            buckets,
+            &json!([
+                {"key": {"myterm": "cherry"}, "doc_count": 1},
+                {"key": {"myterm": "banana"}, "doc_count": 1},
+                {"key": {"myterm": "apple"}, "doc_count": 1}
+            ])
+        );
+        assert!(res["my_composite"].get("after_key").is_none());
+
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_missing_values() -> crate::Result<()> {
+    fn composite_aggregation_term_missing_values() -> crate::Result<()> {
         // Create index with some documents having missing values
         let mut schema_builder = Schema::builder();
         let string_field = schema_builder.add_text_field("string_id", STRING | FAST);
@@ -495,66 +614,43 @@ mod tests {
         }
 
         // Test without missing bucket (should ignore missing values)
-        {
-            let agg_req: Aggregations = serde_json::from_value(json!({
-                "my_composite": {
-                    "composite": {
-                        "sources": [
-                            {"myterm": {"terms": {"field": "string_id", "missing_bucket": false}}}
-                        ],
-                        "size": 10
-                    }
-                }
-            }))
-            .unwrap();
-
-            let res = exec_request(agg_req, &index)?;
-            let buckets = &res["my_composite"]["buckets"];
-
-            // Should only have 2 buckets (terma, termb), missing values ignored
-            assert_eq!(
-                buckets,
-                &json!([
-                    {"key": {"myterm": "terma"}, "doc_count": 2},
-                    {"key": {"myterm": "termb"}, "doc_count": 1}
-                ])
-            );
-        }
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"myterm": {"terms": {"field": "string_id", "missing_bucket": false}}}
+                ],
+                "size": 10
+            }),
+            json!([
+                {"key": {"myterm": "terma"}, "doc_count": 2},
+                {"key": {"myterm": "termb"}, "doc_count": 1}
+            ]),
+        );
 
         // Test with missing bucket enabled
-        {
-            let agg_req: Aggregations = serde_json::from_value(json!({
-                "my_composite": {
-                    "composite": {
-                        "sources": [
-                            {"myterm": {"terms": {"field": "string_id", "missing_bucket": true}}}
-                        ],
-                        "size": 10
-                    }
-                }
-            }))
-            .unwrap();
-
-            let res = exec_request(agg_req, &index)?;
-            let buckets = &res["my_composite"]["buckets"];
-
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"myterm": {"terms": {"field": "string_id", "missing_bucket": true}}}
+                ],
+                "size": 10
+            }),
             // Should have 3 buckets including the missing bucket
             // Missing bucket should come first in ascending order by default
-            assert_eq!(
-                buckets,
-                &json!([
-                    {"key": {"myterm": null}, "doc_count": 1},
-                    {"key": {"myterm": "terma"}, "doc_count": 2},
-                    {"key": {"myterm": "termb"}, "doc_count": 1}
-                ])
-            );
-        }
+            json!([
+                {"key": {"myterm": null}, "doc_count": 1},
+                {"key": {"myterm": "terma"}, "doc_count": 2},
+                {"key": {"myterm": "termb"}, "doc_count": 1}
+            ]),
+        );
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_missing_order() -> crate::Result<()> {
+    fn composite_aggregation_term_missing_order() -> crate::Result<()> {
         // Create index with missing values
         let mut schema_builder = Schema::builder();
         let string_field = schema_builder.add_text_field("string_id", STRING | FAST);
@@ -569,115 +665,85 @@ mod tests {
         }
 
         // Test missing_order: "first"
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {
-                            "myterm": {
-                                "terms": {
-                                    "field": "string_id",
-                                    "missing_bucket": true,
-                                    "missing_order": "first",
-                                    "order": "asc"
-                                }
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {
+                        "myterm": {
+                            "terms": {
+                                "field": "string_id",
+                                "missing_bucket": true,
+                                "missing_order": "first",
+                                "order": "asc"
                             }
                         }
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-
-        // Missing should be first
-        assert_eq!(
-            buckets,
-            &json!([
+                    }
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"myterm": null}, "doc_count": 1},
                 {"key": {"myterm": "terma"}, "doc_count": 1},
                 {"key": {"myterm": "termb"}, "doc_count": 1}
-            ])
+            ]),
         );
 
         // Test missing_order: "last"
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {
-                            "myterm": {
-                                "terms": {
-                                    "field": "string_id",
-                                    "missing_bucket": true,
-                                    "missing_order": "last",
-                                    "order": "asc"
-                                }
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {
+                        "myterm": {
+                            "terms": {
+                                "field": "string_id",
+                                "missing_bucket": true,
+                                "missing_order": "last",
+                                "order": "asc"
                             }
                         }
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-
-        // Missing should be last
-        assert_eq!(
-            buckets,
-            &json!([
+                    }
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"myterm": "terma"}, "doc_count": 1},
                 {"key": {"myterm": "termb"}, "doc_count": 1},
                 {"key": {"myterm": null}, "doc_count": 1}
-            ])
+            ]),
         );
 
         // Test missing_order: "default" with desc order
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {
-                            "myterm": {
-                                "terms": {
-                                    "field": "string_id",
-                                    "missing_bucket": true,
-                                    "missing_order": "default",
-                                    "order": "desc"
-                                }
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {
+                        "myterm": {
+                            "terms": {
+                                "field": "string_id",
+                                "missing_bucket": true,
+                                "missing_order": "default",
+                                "order": "desc"
                             }
                         }
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-
-        // In desc order with default missing_order, missing should appear last
-        assert_eq!(
-            buckets,
-            &json!([
+                    }
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"myterm": "termb"}, "doc_count": 1},
                 {"key": {"myterm": "terma"}, "doc_count": 1},
                 {"key": {"myterm": null}, "doc_count": 1}
-            ])
+            ]),
         );
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_multi_source() -> crate::Result<()> {
+    fn composite_aggregation_term_multi_source() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let cat = schema_builder.add_text_field("category", STRING | FAST);
         let status = schema_builder.add_text_field("status", STRING | FAST);
@@ -693,39 +759,30 @@ mod tests {
             index_writer.commit()?;
         }
 
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"category": {"terms": {"field": "category"}}},
-                        {"status": {"terms": {"field": "status"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-
-        // Should have composite keys with both dimensions in sorted order
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"category": {"terms": {"field": "category"}}},
+                    {"status": {"terms": {"field": "status"}}}
+                ],
+                "size": 10
+            }),
+            // Should have composite keys with both dimensions in sorted order
+            json!([
                 {"key": {"category": "books", "status": "active"}, "doc_count": 1},
                 {"key": {"category": "books", "status": "inactive"}, "doc_count": 1},
                 {"key": {"category": "clothing", "status": "active"}, "doc_count": 1},
                 {"key": {"category": "electronics", "status": "active"}, "doc_count": 2},
                 {"key": {"category": "electronics", "status": "inactive"}, "doc_count": 1}
-            ])
+            ]),
         );
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_multi_source_ordering() -> crate::Result<()> {
+    fn composite_aggregation_term_multi_source_ordering() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let cat = schema_builder.add_text_field("category", STRING | FAST);
         let priority = schema_builder.add_text_field("priority", STRING | FAST);
@@ -740,38 +797,28 @@ mod tests {
         }
 
         // Test with different ordering on different sources
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"category": {"terms": {"field": "category", "order": "asc"}}},
-                        {"priority": {"terms": {"field": "priority", "order": "desc"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-
-        // Should be sorted by category asc, then priority desc
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"category": {"terms": {"field": "category", "order": "asc"}}},
+                    {"priority": {"terms": {"field": "priority", "order": "desc"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"category": "apple", "priority": "low"}, "doc_count": 1},
                 {"key": {"category": "apple", "priority": "high"}, "doc_count": 1},
                 {"key": {"category": "zebra", "priority": "low"}, "doc_count": 1},
                 {"key": {"category": "zebra", "priority": "high"}, "doc_count": 1}
-            ])
+            ]),
         );
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_with_sub_aggregations() -> crate::Result<()> {
+    fn composite_aggregation_term_with_sub_aggregations() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let score_field = schema_builder.add_f64_field("score_f64", FAST);
         let string_field = schema_builder.add_text_field("string_id", STRING | FAST);
@@ -835,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_aggregation_test_validation_errors() -> crate::Result<()> {
+    fn composite_aggregation_term_validation_errors() -> crate::Result<()> {
         // Create index with explicit document creation
         let mut schema_builder = Schema::builder();
         let string_field = schema_builder.add_text_field("string_id", STRING | FAST);
@@ -881,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_aggregation_test_numeric_fields() -> crate::Result<()> {
+    fn composite_aggregation_term_numeric_fields() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let score_field = schema_builder.add_f64_field("score", FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -890,41 +937,31 @@ mod tests {
             index_writer.add_document(doc!(score_field => 1.0f64))?;
             index_writer.add_document(doc!(score_field => 2.0f64))?;
             index_writer.add_document(doc!(score_field => 1.0f64))?;
-            index_writer.add_document(doc!(score_field => 3.0f64))?;
+            index_writer.add_document(doc!(score_field => 3f64))?;
             index_writer.commit()?;
         }
 
         // Test composite aggregation on numeric field
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"score": {"terms": {"field": "score"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-
-        // Should be ordered by numeric value
-        assert_eq!(
-            buckets,
-            &json!([
-                {"key": {"score": 1}, "doc_count": 2}, // Two docs with score 1.0
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"score": {"terms": {"field": "score"}}}
+                ],
+                "size": 10
+            }),
+            json!([
+                {"key": {"score": 1}, "doc_count": 2},
                 {"key": {"score": 2}, "doc_count": 1},
                 {"key": {"score": 3}, "doc_count": 1}
-            ])
+            ]),
         );
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_date_fields() -> crate::Result<()> {
+    fn composite_aggregation_term_date_fields() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let date_field = schema_builder.add_date_field("timestamp", FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -943,36 +980,26 @@ mod tests {
         }
 
         // Test composite aggregation on date field
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"timestamp": {"terms": {"field": "timestamp"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-
-        // Should be ordered by date value (as formatted strings)
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"timestamp": {"terms": {"field": "timestamp"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"timestamp": "2021-01-01T00:00:00Z"}, "doc_count": 2},
                 {"key": {"timestamp": "2022-01-01T00:00:00Z"}, "doc_count": 1},
                 {"key": {"timestamp": "2023-01-01T00:00:00Z"}, "doc_count": 1}
-            ])
+            ]),
         );
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_ip_fields() -> crate::Result<()> {
+    fn composite_aggregation_term_ip_fields() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let ip_field = schema_builder.add_ip_addr_field("ip_addr", FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -986,43 +1013,34 @@ mod tests {
             index_writer.add_document(doc!(ip_field => ipv4("172.16.0.1")))?;
             index_writer.add_document(doc!(ip_field => ipv6("2001:db8::1")))?;
             index_writer.add_document(doc!(ip_field => ipv6("::1")))?; // localhost
+            index_writer.add_document(doc!())?;
             index_writer.add_document(doc!(ip_field => ipv6("2001:db8::1")))?; // duplicate
             index_writer.commit()?;
         }
 
         // Test composite aggregation on IP field
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"ip_addr": {"terms": {"field": "ip_addr"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-
-        // Should be ordered by IP address
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"ip_addr": {"terms": {"field": "ip_addr"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"ip_addr": "::1"}, "doc_count": 1},
                 {"key": {"ip_addr": "10.0.0.1"}, "doc_count": 1},
                 {"key": {"ip_addr": "172.16.0.1"}, "doc_count": 1},
                 {"key": {"ip_addr": "192.168.1.1"}, "doc_count": 2},
                 {"key": {"ip_addr": "2001:db8::1"}, "doc_count": 2}
-            ])
+            ]),
         );
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_multiple_column_types() -> crate::Result<()> {
+    fn composite_aggregation_term_multiple_column_types() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let score_field = schema_builder.add_f64_field("score", FAST);
         let string_field = schema_builder.add_text_field("string_id", STRING | FAST);
@@ -1039,35 +1057,28 @@ mod tests {
         }
 
         // Test composite aggregation mixing numeric and text fields
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"category": {"terms": {"field": "string_id", "order": "asc"}}},
-                        {"score": {"terms": {"field": "score", "order": "desc"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"category": {"terms": {"field": "string_id", "order": "asc"}}},
+                    {"score": {"terms": {"field": "score", "order": "desc"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"category": "apple", "score": 1}, "doc_count": 2},
                 {"key": {"category": "banana", "score": 2}, "doc_count": 2},
                 {"key": {"category": "banana", "score": 1}, "doc_count": 1},
                 {"key": {"category": "cherry", "score": 3}, "doc_count": 1}
-            ])
+            ]),
         );
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_json_various_types() -> crate::Result<()> {
+    fn composite_aggregation_term_json_various_types() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json_data", FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -1088,36 +1099,29 @@ mod tests {
             index_writer.commit()?;
         }
 
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"cat": {"terms": {"field": "json_data.cat"}}},
-                        {"avail": {"terms": {"field": "json_data.avail"}}},
-                        {"price": {"terms": {"field": "json_data.price", "order": "desc"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"cat": {"terms": {"field": "json_data.cat"}}},
+                    {"avail": {"terms": {"field": "json_data.avail"}}},
+                    {"price": {"terms": {"field": "json_data.price", "order": "desc"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"cat": "books", "avail": false, "price": 15}, "doc_count": 1},
                 {"key": {"cat": "books", "avail": true, "price": 25}, "doc_count": 1},
                 {"key": {"cat": "elec", "avail": true, "price": 999}, "doc_count": 1},
                 {"key": {"cat": "elec", "avail": true, "price": 200}, "doc_count": 1}
-            ])
+            ]),
         );
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_json_missing_fields() -> crate::Result<()> {
+    fn composite_aggregation_term_json_missing_fields() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json_data", FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -1135,36 +1139,29 @@ mod tests {
         }
 
         // Test with missing bucket enabled
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"cat": {"terms": {"field": "json_data.cat", "missing_bucket": true}}},
-                        {"brand": {"terms": {"field": "json_data.brand", "missing_bucket": true, "missing_order": "last"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"cat": {"terms": {"field": "json_data.cat", "missing_bucket": true}}},
+                    {"brand": {"terms": {"field": "json_data.brand", "missing_bucket": true, "missing_order": "last"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"cat": null, "brand": "samsung"}, "doc_count": 1},
                 {"key": {"cat": "books", "brand": "gut"}, "doc_count": 1},
                 {"key": {"cat": "books", "brand": null}, "doc_count": 1},
                 {"key": {"cat": "elec", "brand": "apple"}, "doc_count": 1},
                 {"key": {"cat": "elec", "brand": "samsung"}, "doc_count": 1}
-            ])
+            ]),
         );
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_json_nested_fields() -> crate::Result<()> {
+    fn composite_aggregation_term_json_nested_fields() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json_data", FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -1185,35 +1182,28 @@ mod tests {
             index_writer.commit()?;
         }
 
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"name": {"terms": {"field": "json_data.prod.name"}}},
-                        {"cpu": {"terms": {"field": "json_data.prod.cpu"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"name": {"terms": {"field": "json_data.prod.name"}}},
+                    {"cpu": {"terms": {"field": "json_data.prod.cpu"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"name": "laptop", "cpu": "amd"}, "doc_count": 1},
                 {"key": {"name": "laptop", "cpu": "intel"}, "doc_count": 1},
                 {"key": {"name": "phone", "cpu": "snap"}, "doc_count": 1},
                 {"key": {"name": "tablet", "cpu": "intel"}, "doc_count": 1}
-            ])
+            ]),
         );
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_json_mixed_types() -> crate::Result<()> {
+    fn composite_aggregation_term_json_mixed_types() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json_data", FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -1229,22 +1219,15 @@ mod tests {
             index_writer.commit()?;
         }
 
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"id": {"terms": {"field": "json_data.id", "order": "asc"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"id": {"terms": {"field": "json_data.id", "order": "asc"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"id": false}, "doc_count": 1},
                 {"key": {"id": true}, "doc_count": 1},
                 {"key": {"id": "doc1"}, "doc_count": 1},
@@ -1252,26 +1235,19 @@ mod tests {
                 {"key": {"id": "doc3"}, "doc_count": 1},
                 {"key": {"id": 50}, "doc_count": 1},
                 {"key": {"id": 100}, "doc_count": 1}
-            ])
+            ]),
         );
 
         // Test descending order
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"id": {"terms": {"field": "json_data.id", "order": "desc"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"id": {"terms": {"field": "json_data.id", "order": "desc"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"id": 100}, "doc_count": 1},
                 {"key": {"id": 50}, "doc_count": 1},
                 {"key": {"id": "doc3"}, "doc_count": 1},
@@ -1279,16 +1255,83 @@ mod tests {
                 {"key": {"id": "doc1"}, "doc_count": 1},
                 {"key": {"id": true}, "doc_count": 1},
                 {"key": {"id": false}, "doc_count": 1}
-            ])
+            ]),
         );
 
         Ok(())
     }
 
-    // TODO add test with no column match
+    #[test]
+    fn composite_aggregation_term_multi_value_fields() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", FAST | STRING);
+        let num_field = schema_builder.add_u64_field("num", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+            // Document with multiple values for text and num fields
+            index_writer.add_document(doc!(
+                text_field => "apple",
+                text_field => "banana",
+                num_field => 10u64,
+                num_field => 20u64,
+            ))?;
+            index_writer.add_document(doc!(
+                text_field => "cherry",
+                num_field => 30u64,
+            ))?;
+            // Multi valued document with duplicate values
+            index_writer.add_document(doc!(
+                text_field => "elderberry",
+                text_field => "date",
+                text_field => "elderberry",
+                num_field => 40u64,
+            ))?;
+
+            index_writer.commit()?;
+        }
+
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"text_terms": {"terms": {"field": "text"}}}
+                ],
+                "size": 10
+            }),
+            json!([
+                {"key": {"text_terms": "apple"}, "doc_count": 1},
+                {"key": {"text_terms": "banana"}, "doc_count": 1},
+                {"key": {"text_terms": "cherry"}, "doc_count": 1},
+                {"key": {"text_terms": "date"}, "doc_count": 1},
+                // this is not the doc count but the term occurrence count
+                // https://github.com/quickwit-oss/tantivy/issues/2721
+                {"key": {"text_terms": "elderberry"}, "doc_count": 2}
+            ]),
+        );
+
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"num_terms": {"terms": {"field": "num"}}}
+                ],
+                "size": 10
+            }),
+            json!([
+                {"key": {"num_terms": 10}, "doc_count": 1},
+                {"key": {"num_terms": 20}, "doc_count": 1},
+                {"key": {"num_terms": 30}, "doc_count": 1},
+                {"key": {"num_terms": 40}, "doc_count": 1}
+            ]),
+        );
+
+        Ok(())
+    }
 
     #[test]
-    fn composite_aggregation_test_histogram_source() -> crate::Result<()> {
+    fn composite_aggregation_histogram_basic() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let num_field = schema_builder.add_f64_field("value", FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -1303,32 +1346,25 @@ mod tests {
         }
 
         // Histogram with interval 5
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"val_hist": {"histogram": {"field": "value", "interval": 5.0}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"val_hist": {"histogram": {"field": "value", "interval": 5.0}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"val_hist": 0.0}, "doc_count": 2},
                 {"key": {"val_hist": 5.0}, "doc_count": 2},
                 {"key": {"val_hist": 10.0}, "doc_count": 1}
-            ])
+            ]),
         );
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_date_histogram_calendar_source() -> crate::Result<()> {
+    fn composite_aggregation_date_histogram_calendar_interval() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let date_field = schema_builder.add_date_field("dt", FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -1346,31 +1382,25 @@ mod tests {
         }
 
         // Date histogram with calendar_interval = "year"
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"dt_hist": {"date_histogram": {"field": "dt", "calendar_interval": "year"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        })).unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"dt_hist": {"date_histogram": {"field": "dt", "calendar_interval": "year"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"dt_hist": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z")}, "doc_count": 2},
                 {"key": {"dt_hist": ms_timestamp_from_iso_str("2022-01-01T00:00:00Z")}, "doc_count": 1},
                 {"key": {"dt_hist": ms_timestamp_from_iso_str("2023-01-01T00:00:00Z")}, "doc_count": 1}
-            ])
+            ]),
         );
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_date_histogram_fixed_interval() -> crate::Result<()> {
+    fn composite_aggregation_date_histogram_fixed_interval() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let date_field = schema_builder.add_date_field("dt", FAST);
         let index = Index::create_in_ram(schema_builder.build());
@@ -1389,33 +1419,26 @@ mod tests {
             index_writer.commit()?;
         }
 
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"dt_hist": {"date_histogram": {"field": "dt", "fixed_interval": "6h"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"dt_hist": {"date_histogram": {"field": "dt", "fixed_interval": "6h"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"dt_hist": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z")}, "doc_count": 2},
                 {"key": {"dt_hist": ms_timestamp_from_iso_str("2021-01-01T06:00:00Z")}, "doc_count": 1},
                 {"key": {"dt_hist": ms_timestamp_from_iso_str("2021-01-01T12:00:00Z")}, "doc_count": 1},
                 {"key": {"dt_hist": ms_timestamp_from_iso_str("2021-01-01T18:00:00Z")}, "doc_count": 1}
-            ])
+            ]),
         );
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_mixed_term_and_date_histogram() -> crate::Result<()> {
+    fn composite_aggregation_mixed_term_and_date_histogram() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let date_field = schema_builder.add_date_field("timestamp", FAST);
         let category_field = schema_builder.add_text_field("category", STRING | FAST);
@@ -1451,28 +1474,21 @@ mod tests {
             index_writer.commit()?;
         }
 
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_composite": {
-                "composite": {
-                    "sources": [
-                        {"category": {"terms": {"field": "category"}}},
-                        {"month": {"date_histogram": {"field": "timestamp", "calendar_interval": "month"}}}
-                    ],
-                    "size": 10
-                }
-            }
-        }))
-        .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let buckets = &res["my_composite"]["buckets"];
-        assert_eq!(
-            buckets,
-            &json!([
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"category": {"terms": {"field": "category"}}},
+                    {"month": {"date_histogram": {"field": "timestamp", "calendar_interval": "month"}}}
+                ],
+                "size": 10
+            }),
+            json!([
                 {"key": {"category": "books", "month": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z")}, "doc_count": 1},
                 {"key": {"category": "books", "month": ms_timestamp_from_iso_str("2021-02-01T00:00:00Z")}, "doc_count": 1},
                 {"key": {"category": "clothing", "month": ms_timestamp_from_iso_str("2021-02-01T00:00:00Z")}, "doc_count": 2},
                 {"key": {"category": "electronics", "month": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z")}, "doc_count": 2}
-            ])
+            ]),
         );
 
         // Test with different ordering for sources with a size limit
@@ -1496,14 +1512,38 @@ mod tests {
                 {"key": {"month": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z"), "category": "electronics"}, "doc_count": 2},
                 {"key": {"month": ms_timestamp_from_iso_str("2021-01-01T00:00:00Z"), "category": "books"}, "doc_count": 1},
                 {"key": {"month": ms_timestamp_from_iso_str("2021-02-01T00:00:00Z"), "category": "clothing"}, "doc_count": 2},
-            ])
+            ]),
         );
+
+        // next page
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_composite": {
+                "composite": {
+                    "sources": [
+                        {"month": {"date_histogram": {"field": "timestamp", "calendar_interval": "month"}}},
+                        {"category": {"terms": {"field": "category", "order": "desc"}}}
+                    ],
+                    "size": 3,
+                    "after": res["my_composite"]["after_key"]
+                }
+            }
+        }))
+        .unwrap();
+        let res = exec_request(agg_req, &index)?;
+        let buckets = &res["my_composite"]["buckets"];
+        assert_eq!(
+            buckets,
+            &json!([
+                {"key": {"month": ms_timestamp_from_iso_str("2021-02-01T00:00:00Z"), "category": "books"}, "doc_count": 1},
+            ]),
+        );
+        assert!(res["my_composite"].get("after_key").is_none());
 
         Ok(())
     }
 
     #[test]
-    fn composite_aggregation_test_no_matching_columns() -> crate::Result<()> {
+    fn composite_aggregation_no_matching_columns() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let date_field = schema_builder.add_f64_field("dt", FAST);
         let index = Index::create_in_ram(schema_builder.build());

@@ -12,11 +12,13 @@ use smallvec::SmallVec;
 use crate::aggregation::agg_data::{
     build_segment_agg_collectors, AggRefNode, AggregationsSegmentCtx,
 };
+use crate::aggregation::bucket::composite::accessors::{
+    CompositeAccessor, CompositeAggReqData, PrecomputedDateInterval,
+};
 use crate::aggregation::bucket::composite::calendar_interval;
 use crate::aggregation::bucket::composite::map::{DynArrayHeapMap, MAX_DYN_ARRAY_SIZE};
 use crate::aggregation::bucket::{
-    parse_into_milliseconds, CalendarInterval, CompositeAggregation, CompositeAggregationSource,
-    MissingOrder, Order,
+    CalendarInterval, CompositeAggregationSource, MissingOrder, Order,
 };
 use crate::aggregation::format_date;
 use crate::aggregation::intermediate_agg_result::{
@@ -146,6 +148,7 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
                 0,
                 &mut sub_level_values,
                 &mut self.buckets,
+                true,
             )?;
         }
         agg_data.put_back_composite_req_data(self.accessor_idx, composite_agg_data);
@@ -253,31 +256,62 @@ fn validate_req(req_data: &mut AggregationsSegmentCtx, accessor_idx: usize) -> c
             "composite aggregation 'size' must be > 0".to_string(),
         ));
     }
-    let col_types = composite_data
-        .composite_accessors
-        .iter()
-        .map(|accessors| accessors.iter().map(|a| a.column_type).collect::<Vec<_>>());
+    let column_types_for_sources = composite_data.composite_accessors.iter().map(|item| {
+        item.accessors
+            .iter()
+            .map(|a| a.column_type)
+            .collect::<Vec<_>>()
+    });
 
-    for source_columns in col_types {
-        if source_columns.len() > MAX_DYN_ARRAY_SIZE {
+    for (source, column_types) in req.sources.iter().zip(column_types_for_sources) {
+        if column_types.len() > MAX_DYN_ARRAY_SIZE {
             return Err(TantivyError::InvalidArgument(format!(
                 "composite aggregation source supports maximum {MAX_DYN_ARRAY_SIZE} sources",
             )));
         }
-        if source_columns.contains(&ColumnType::Bytes) {
+        if column_types.contains(&ColumnType::Bytes) {
             return Err(TantivyError::InvalidArgument(
                 "composite aggregation does not support 'bytes' field type".to_string(),
             ));
         }
-        if source_columns.contains(&ColumnType::DateTime) && source_columns.len() > 1 {
+        if column_types.contains(&ColumnType::DateTime) && column_types.len() > 1 {
             return Err(TantivyError::InvalidArgument(
                 "composite aggregation expects 'date' fields to have a single column".to_string(),
             ));
         }
-        if source_columns.contains(&ColumnType::IpAddr) && source_columns.len() > 1 {
+        if column_types.contains(&ColumnType::IpAddr) && column_types.len() > 1 {
             return Err(TantivyError::InvalidArgument(
                 "composite aggregation expects 'ip' fields to have a single column".to_string(),
             ));
+        }
+        match source {
+            CompositeAggregationSource::Terms(_) => {
+                if column_types.len() > 3 {
+                    return Err(TantivyError::InvalidArgument(
+                        "expected at most 3 columns for composite aggregation 'terms' source \
+                         (text, numerical and boolean)"
+                            .to_string(),
+                    ));
+                }
+            }
+            CompositeAggregationSource::Histogram(_) => {
+                if column_types.len() > 1 {
+                    return Err(TantivyError::InvalidArgument(
+                        "expected at most 1 column for composite aggregation 'histogram' source \
+                         (numerical or date)"
+                            .to_string(),
+                    ));
+                }
+            }
+            CompositeAggregationSource::DateHistogram(_) => {
+                if column_types.len() > 1 {
+                    return Err(TantivyError::InvalidArgument(
+                        "expected at most 1 column (date) for composite aggregation \
+                         'date_histogram' source"
+                            .to_string(),
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -334,7 +368,7 @@ fn resolve_key(
             resolve_internal_value_repr(
                 *val,
                 &agg_data.req.sources[idx],
-                &agg_data.composite_accessors[idx],
+                &agg_data.composite_accessors[idx].accessors,
             )
         })
         .collect()
@@ -436,33 +470,40 @@ fn recursive_key_visitor(
     doc_id: crate::DocId,
     agg_data: &mut AggregationsSegmentCtx,
     composite_agg_data: &CompositeAggReqData,
-    source_offset: usize,
+    source_idx_for_recursion: usize,
     sub_level_values: &mut SmallVec<[InternalValueRepr; MAX_DYN_ARRAY_SIZE]>,
     buckets: &mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
+    // whether the we need to considere the after_key in the following levels
+    is_on_after_key: bool,
 ) -> crate::Result<()> {
-    if source_offset == composite_agg_data.req.sources.len() {
-        collect_bucket_with_limit(
-            doc_id,
-            agg_data,
-            composite_agg_data,
-            buckets,
-            sub_level_values,
-        )?;
+    if source_idx_for_recursion == composite_agg_data.req.sources.len() {
+        if !is_on_after_key {
+            collect_bucket_with_limit(
+                doc_id,
+                agg_data,
+                composite_agg_data,
+                buckets,
+                sub_level_values,
+            )?;
+        }
         return Ok(());
     }
 
-    let current_level_accessor = &composite_agg_data.composite_accessors[source_offset];
-    let current_level_source = &composite_agg_data.req.sources[source_offset];
+    let current_level_accessor = &composite_agg_data.composite_accessors[source_idx_for_recursion];
+    let current_level_source = &composite_agg_data.req.sources[source_idx_for_recursion];
     let mut missing = true;
-    for (i, accessor) in current_level_accessor.iter().enumerate() {
+    for (i, accessor) in current_level_accessor.accessors.iter().enumerate() {
         // TODO: optimize with prefetching using fetch_block
+        // TODO: currently duplicate values for a document imply double counting
+        // in doc_count (this is also the case in term aggregations)
         let values = accessor.column.values_for_doc(doc_id);
         for value in values {
             missing = false;
-            match current_level_source {
-                CompositeAggregationSource::Terms(source) => {
-                    sub_level_values.push(InternalValueRepr::new(value, i as u8, source.order));
-                }
+            if is_on_after_key && i < current_level_accessor.after_key_accessor_idx {
+                break;
+            }
+            let bucket_value: u64 = match current_level_source {
+                CompositeAggregationSource::Terms(_) => value,
                 CompositeAggregationSource::Histogram(source) => {
                     let float_value = match accessor.column_type {
                         ColumnType::U64 => value as f64,
@@ -479,14 +520,9 @@ fn recursive_key_visitor(
                         }
                     };
                     let bucket_value = (float_value / source.interval).floor() * source.interval;
-                    let bucket_value_u64 = f64::to_u64(bucket_value);
-                    sub_level_values.push(InternalValueRepr::new(
-                        bucket_value_u64,
-                        i as u8,
-                        source.order,
-                    ));
+                    f64::to_u64(bucket_value)
                 }
-                CompositeAggregationSource::DateHistogram(hist_source) => {
+                CompositeAggregationSource::DateHistogram(_) => {
                     let value_ns = match accessor.column_type {
                         // Dates are stored as nanoseconds since epoch but the
                         // interval is in milliseconds
@@ -515,133 +551,58 @@ fn recursive_key_visitor(
                             panic!("interval not precomputed for date histogram source")
                         }
                     };
-                    let bucket_value_u64 = i64::to_u64(bucket_value_i64);
-                    sub_level_values.push(InternalValueRepr::new(
-                        bucket_value_u64,
-                        i as u8,
-                        hist_source.order,
-                    ));
+                    i64::to_u64(bucket_value_i64)
                 }
+            };
+
+            if i == current_level_accessor.after_key_accessor_idx
+                && is_on_after_key
+                && current_level_source.order() == Order::Asc
+                && current_level_accessor.after_key.gt(bucket_value)
+            {
+                continue;
             }
+            if i == current_level_accessor.after_key_accessor_idx
+                && is_on_after_key
+                && current_level_source.order() == Order::Desc
+                && current_level_accessor.after_key.lt(bucket_value)
+            {
+                continue;
+            }
+            sub_level_values.push(InternalValueRepr::new(
+                bucket_value,
+                i as u8,
+                current_level_source.order(),
+            ));
+            let still_on_after_key = current_level_accessor.after_key_accessor_idx == i
+                && current_level_accessor.after_key.equals(bucket_value);
             recursive_key_visitor(
                 doc_id,
                 agg_data,
                 composite_agg_data,
-                source_offset + 1,
+                source_idx_for_recursion + 1,
                 sub_level_values,
                 buckets,
+                is_on_after_key && still_on_after_key,
             )?;
             sub_level_values.pop();
         }
     }
-    if missing {
-        match current_level_source {
-            CompositeAggregationSource::Terms(source) => {
-                if source.missing_bucket == false {
-                    // missing bucket not requested, skip this branch
-                    return Ok(());
-                }
-                sub_level_values.push(InternalValueRepr::new_missing(
-                    source.order,
-                    source.missing_order,
-                ));
-            }
-            CompositeAggregationSource::Histogram(source) => {
-                if source.missing_bucket == false {
-                    // missing bucket not requested, skip this branch
-                    return Ok(());
-                }
-                sub_level_values.push(InternalValueRepr::new_missing(
-                    source.order,
-                    source.missing_order,
-                ));
-            }
-            CompositeAggregationSource::DateHistogram(source) => {
-                if source.missing_bucket == false {
-                    // missing bucket not requested, skip this branch
-                    return Ok(());
-                }
-                sub_level_values.push(InternalValueRepr::new_missing(
-                    source.order,
-                    source.missing_order,
-                ));
-            }
-        }
-
+    if missing && !current_level_accessor.skip_missing {
+        sub_level_values.push(InternalValueRepr::new_missing(
+            current_level_source.order(),
+            current_level_source.missing_order(),
+        ));
         recursive_key_visitor(
             doc_id,
             agg_data,
             composite_agg_data,
-            source_offset + 1,
+            source_idx_for_recursion + 1,
             sub_level_values,
             buckets,
+            is_on_after_key && current_level_accessor.is_after_key_explicit_missing,
         )?;
         sub_level_values.pop();
     }
     Ok(())
-}
-
-// context data for a composite aggregation
-
-/// Contains all information required by the [SegmentCompositeCollector] to perform the
-/// composite aggregation on a segment.
-pub struct CompositeAggReqData {
-    /// Note: sub_aggregation_blueprint is filled later when building collectors
-    pub sub_aggregation_blueprint: Option<Box<dyn SegmentAggregationCollector>>,
-    /// The name of the aggregation.
-    pub name: String,
-    /// The normalized term aggregation request.
-    pub req: CompositeAggregation,
-    /// Accessors for each source, each source can have multiple accessors (columns).
-    pub composite_accessors: Vec<Vec<CompositeAccessor>>,
-}
-
-/// A parsed representation of the date interval for date histogram sources
-#[derive(Clone, Copy, Debug)]
-pub enum PrecomputedDateInterval {
-    /// This is not a date histogram source
-    NotApplicable,
-    /// Source was configured with a fixed interval
-    FixedMilliseconds(i64),
-    /// Source was configured with a calendar interval
-    Calendar(CalendarInterval),
-}
-
-impl PrecomputedDateInterval {
-    /// Validates the date histogram source interval fields and parses a date interval from them.
-    pub fn from_date_histogram_source_intervals(
-        fixed_interval: &Option<String>,
-        calendar_interval: Option<CalendarInterval>,
-    ) -> crate::Result<Self> {
-        match (fixed_interval, calendar_interval) {
-            (Some(_), Some(_)) | (None, None) => Err(TantivyError::InvalidArgument(
-                "date histogram source must one and only one of fixed_interval or \
-                 calendar_interval set"
-                    .to_string(),
-            )),
-            (Some(fixed_interval), None) => {
-                let fixed_interval_ms = parse_into_milliseconds(&fixed_interval)?;
-                Ok(PrecomputedDateInterval::FixedMilliseconds(
-                    fixed_interval_ms,
-                ))
-            }
-            (None, Some(calendar_interval)) => {
-                Ok(PrecomputedDateInterval::Calendar(calendar_interval))
-            }
-        }
-    }
-}
-
-/// Accessors for a single column in a composite source.
-pub struct CompositeAccessor {
-    /// The fast field column
-    pub column: Column<u64>,
-    /// The column type
-    pub column_type: ColumnType,
-    /// Term dictionary if the column type is Str
-    ///
-    /// Only used by term sources
-    pub str_dict_column: Option<StrColumn>,
-    /// Parsed date interval for date histogram sources
-    pub date_histogram_interval: PrecomputedDateInterval,
 }
