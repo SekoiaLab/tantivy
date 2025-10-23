@@ -1263,6 +1263,25 @@ mod tests {
             ]),
         );
 
+        // Small twist on the missing order of the second source
+        exec_and_assert_all_paginations(
+            &index,
+            json!({
+                "sources": [
+                    {"cat": {"terms": {"field": "json_data.cat", "missing_bucket": true}}},
+                    {"brand": {"terms": {"field": "json_data.brand", "missing_bucket": true, "missing_order": "first"}}}
+                ],
+                "size": 10
+            }),
+            json!([
+                {"key": {"cat": null, "brand": "samsung"}, "doc_count": 1},
+                {"key": {"cat": "books", "brand": null}, "doc_count": 1},
+                {"key": {"cat": "books", "brand": "gut"}, "doc_count": 1},
+                {"key": {"cat": "elec", "brand": "apple"}, "doc_count": 1},
+                {"key": {"cat": "elec", "brand": "samsung"}, "doc_count": 1}
+            ]),
+        );
+
         Ok(())
     }
 

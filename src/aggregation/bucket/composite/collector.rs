@@ -592,7 +592,10 @@ fn recursive_key_visitor(
             sub_level_values.pop();
         }
     }
-    if missing && !current_level_accessor.skip_missing {
+    if missing && current_level_source.missing_bucket() {
+        if is_on_after_key && current_level_accessor.skip_missing {
+            return Ok(());
+        }
         sub_level_values.push(InternalValueRepr::new_missing(
             current_level_source.order(),
             current_level_source.missing_order(),

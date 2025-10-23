@@ -60,9 +60,11 @@ pub struct CompositeSourceAccessors {
     /// kept without comparison to the after_key.
     pub after_key_accessor_idx: usize,
 
-    /// Whether to skip missing values, either because they were not requested
-    /// or because they are skipped by the after_key.
+    /// Whether to skip missing values because of the after_key. Skipping only
+    /// applies if the value for previous columns were exactly equal to the
+    /// corresponding after keys (is_on_after_key).
     pub skip_missing: bool,
+
     /// The after key was set to null to indicate that the last collected key
     /// was a missing value.
     pub is_after_key_explicit_missing: bool,
@@ -83,7 +85,7 @@ impl CompositeSourceAccessors {
         let is_after_key_explicit_missing = source_after_key_opt
             .map(|after_key| matches!(after_key, CompositeKey::Null))
             .unwrap_or(false);
-        let mut skip_missing = !source.missing_bucket();
+        let mut skip_missing = false;
         if let Some(CompositeKey::Null) = source_after_key_opt {
             if !source.missing_bucket() {
                 return Err(TantivyError::InvalidArgument(
@@ -334,17 +336,18 @@ fn precompute_missing_after_key(
     missing_order: MissingOrder,
     order: Order,
 ) -> PrecomputedAfterKey {
-    let key_u64 = match (is_after_key_explicit_missing, missing_order, order) {
-        (true, MissingOrder::First, Order::Asc) => 0,
-        (true, MissingOrder::First, Order::Desc) => u64::MAX,
-        (true, MissingOrder::Last, Order::Asc) => u64::MAX,
-        (true, MissingOrder::Last, Order::Desc) => 0,
-        (true, MissingOrder::Default, Order::Asc) => 0,
-        (true, MissingOrder::Default, Order::Desc) => u64::MAX,
-        (false, _, Order::Asc) => 0,
-        (false, _, Order::Desc) => u64::MAX,
-    };
-    PrecomputedAfterKey::Next(key_u64)
+    let after_last = PrecomputedAfterKey::AfterLast;
+    let before_first = PrecomputedAfterKey::Next(0);
+    match (is_after_key_explicit_missing, missing_order, order) {
+        (true, MissingOrder::First, Order::Asc) => before_first,
+        (true, MissingOrder::First, Order::Desc) => after_last,
+        (true, MissingOrder::Last, Order::Asc) => after_last,
+        (true, MissingOrder::Last, Order::Desc) => before_first,
+        (true, MissingOrder::Default, Order::Asc) => before_first,
+        (true, MissingOrder::Default, Order::Desc) => after_last,
+        (false, _, Order::Asc) => before_first,
+        (false, _, Order::Desc) => after_last,
+    }
 }
 
 /// A parsed representation of the date interval for date histogram sources
