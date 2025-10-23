@@ -5,9 +5,7 @@ use std::str::FromStr;
 use columnar::column_values::{CompactHit, CompactSpaceU64Accessor};
 use columnar::{Column, ColumnType, MonotonicallyMappableToU64, StrColumn, TermOrdHit};
 
-use crate::aggregation::agg_req_with_accessor::{
-    get_all_ff_readers, get_numeric_or_date_column_types,
-};
+use crate::aggregation::accessor_helpers::{get_all_ff_readers, get_numeric_or_date_column_types};
 use crate::aggregation::agg_result::CompositeKey;
 use crate::aggregation::bucket::composite::numeric_types::num_proj;
 use crate::aggregation::bucket::composite::numeric_types::num_proj::ProjectedNumber;

@@ -7,6 +7,7 @@ use columnar::{
     Column, ColumnBlockAccessor, ColumnType, Dictionary, MonotonicallyMappableToU128,
     MonotonicallyMappableToU64, NumericalValue, StrColumn,
 };
+use common::BitSet;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -38,8 +39,6 @@ pub struct TermsAggReqData {
     pub missing_value_for_accessor: Option<u64>,
     /// The column block accessor to access the fast field values.
     pub column_block_accessor: ColumnBlockAccessor<u64>,
-    /// The type of the fast field.
-    pub field_type: ColumnType,
     /// Note: sub_aggregation_blueprint is filled later when building collectors
     pub sub_aggregation_blueprint: Option<Box<dyn SegmentAggregationCollector>>,
     /// Used to build the correct nested result when we have an empty result.
@@ -48,6 +47,21 @@ pub struct TermsAggReqData {
     pub name: String,
     /// The normalized term aggregation request.
     pub req: TermsAggregationInternal,
+    /// Preloaded allowed term ords (string columns only). If set, only ords present are collected.
+    pub allowed_term_ids: Option<BitSet>,
+}
+
+impl TermsAggReqData {
+    /// Estimate the memory consumption of this struct in bytes.
+    pub fn get_memory_consumption(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + std::mem::size_of::<TermsAggregationInternal>()
+            + self
+                .allowed_term_ids
+                .as_ref()
+                .map(|bs| bs.len() / 8)
+                .unwrap_or(0)
+    }
 }
 
 /// Creates a bucket for every unique term and counts the number of occurrences.
@@ -120,6 +134,68 @@ pub struct TermsAggReqData {
 /// }
 /// ```
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum IncludeExcludeParam {
+    /// A single string pattern is treated as regex.
+    Regex(String),
+    /// An array of strings is treated as exact values.
+    Values(Vec<String>),
+}
+
+impl Serialize for IncludeExcludeParam {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        match self {
+            IncludeExcludeParam::Regex(s) => serializer.serialize_str(s),
+            IncludeExcludeParam::Values(v) => v.serialize(serializer),
+        }
+    }
+}
+
+// Custom deserializer to accept either a single string (regex) or an array of strings (values).
+impl<'de> Deserialize<'de> for IncludeExcludeParam {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: serde::Deserializer<'de> {
+        use serde::de::{self, SeqAccess, Visitor};
+        struct IncludeExcludeVisitor;
+
+        impl<'de> Visitor<'de> for IncludeExcludeVisitor {
+            type Value = IncludeExcludeParam;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string (regex) or an array of strings")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where E: de::Error {
+                Ok(IncludeExcludeParam::Regex(v.to_string()))
+            }
+
+            fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+            where E: de::Error {
+                Ok(IncludeExcludeParam::Regex(v.to_string()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where E: de::Error {
+                Ok(IncludeExcludeParam::Regex(v))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where A: SeqAccess<'de> {
+                let mut values: Vec<String> = Vec::new();
+                while let Some(elem) = seq.next_element::<String>()? {
+                    values.push(elem);
+                }
+                Ok(IncludeExcludeParam::Values(values))
+            }
+        }
+
+        deserializer.deserialize_any(IncludeExcludeVisitor)
+    }
+}
+
+/// The terms aggregation allows you to group documents by unique values of a field.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TermsAggregation {
     /// The field to aggregate on.
@@ -189,6 +265,13 @@ pub struct TermsAggregation {
     /// add text.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub missing: Option<Key>,
+
+    /// Include terms by either regex (single string) or exact values (array).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub include: Option<IncludeExcludeParam>,
+    /// Exclude terms by either regex (single string) or exact values (array).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub exclude: Option<IncludeExcludeParam>,
 }
 
 /// Same as TermsAggregation, but with populated defaults.
@@ -330,6 +413,11 @@ impl SegmentAggregationCollector for SegmentTermCollector {
         }
 
         for term_id in req_data.column_block_accessor.iter_vals() {
+            if let Some(allowed_bs) = req_data.allowed_term_ids.as_ref() {
+                if !allowed_bs.contains(term_id as u32) {
+                    continue;
+                }
+            }
             let entry = self.term_buckets.entries.entry(term_id).or_default();
             *entry += 1;
         }
@@ -339,6 +427,11 @@ impl SegmentAggregationCollector for SegmentTermCollector {
                 .column_block_accessor
                 .iter_docid_vals(docs, &req_data.accessor)
             {
+                if let Some(allowed_bs) = req_data.allowed_term_ids.as_ref() {
+                    if !allowed_bs.contains(term_id as u32) {
+                        continue;
+                    }
+                }
                 let sub_aggregations = self
                     .term_buckets
                     .sub_aggs
@@ -375,11 +468,11 @@ impl SegmentTermCollector {
         node: &AggRefNode,
     ) -> crate::Result<Self> {
         let terms_req_data = req_data.get_term_req_data(node.idx_in_req_data);
-        let field_type = terms_req_data.field_type;
+        let column_type = terms_req_data.column_type;
         let accessor_idx = node.idx_in_req_data;
-        if field_type == ColumnType::Bytes {
+        if column_type == ColumnType::Bytes {
             return Err(TantivyError::InvalidArgument(format!(
-                "terms aggregation is not supported for column type {field_type:?}"
+                "terms aggregation is not supported for column type {column_type:?}"
             )));
         }
         let term_buckets = TermBuckets::default();
@@ -552,13 +645,20 @@ impl SegmentTermCollector {
                 let mut stream = term_dict.stream()?;
                 let empty_sub_aggregation =
                     IntermediateAggregationResults::empty_from_req(&term_req.sug_aggregations);
-                while let Some((key, _ord)) = stream.next() {
+                while stream.advance() {
                     if dict.len() >= term_req.req.segment_size as usize {
                         break;
                     }
 
+                    // Respect allowed filters if present
+                    if let Some(allowed_bs) = term_req.allowed_term_ids.as_ref() {
+                        if !allowed_bs.contains(stream.term_ord() as u32) {
+                            continue;
+                        }
+                    }
+
                     let key = IntermediateKey::Str(
-                        std::str::from_utf8(key)
+                        std::str::from_utf8(stream.key())
                             .map_err(|utf8_err| DataCorruption::comment_only(utf8_err.to_string()))?
                             .to_string(),
                     );
@@ -681,12 +781,14 @@ mod tests {
     use time::{Date, Month};
 
     use crate::aggregation::agg_req::Aggregations;
+    use crate::aggregation::intermediate_agg_result::IntermediateAggregationResults;
     use crate::aggregation::tests::{
         exec_request, exec_request_with_query, exec_request_with_query_and_memory_limit,
         get_test_index_from_terms, get_test_index_from_values_and_terms,
     };
-    use crate::aggregation::AggregationLimitsGuard;
+    use crate::aggregation::{AggregationLimitsGuard, DistributedAggregationCollector};
     use crate::indexer::NoMergePolicy;
+    use crate::query::AllQuery;
     use crate::schema::{IntoIpv6Addr, Schema, FAST, STRING};
     use crate::{Index, IndexWriter};
 
@@ -750,6 +852,77 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(res["my_texts"]["sum_other_doc_count"], 1);
+
+        // include filter: only terma and termc
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "include": ["terma", "termc"],
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index)?;
+        assert_eq!(res["my_texts"]["buckets"][0]["key"], "terma");
+        assert_eq!(res["my_texts"]["buckets"][0]["doc_count"], 5);
+        assert_eq!(res["my_texts"]["buckets"][1]["key"], "termc");
+        assert_eq!(res["my_texts"]["buckets"][1]["doc_count"], 1);
+        assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
+
+        // exclude filter: remove termc
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "exclude": ["termc"],
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index)?;
+        assert_eq!(res["my_texts"]["buckets"][0]["key"], "terma");
+        assert_eq!(res["my_texts"]["buckets"][0]["doc_count"], 5);
+        assert_eq!(res["my_texts"]["buckets"][1]["key"], "termb");
+        assert_eq!(res["my_texts"]["buckets"][1]["doc_count"], 2);
+        assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
+
+        // include regex (single string): only termb
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "include": "termb",
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index)?;
+        assert_eq!(res["my_texts"]["buckets"][0]["key"], "termb");
+        assert_eq!(res["my_texts"]["buckets"][0]["doc_count"], 2);
+        assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
+
+        // include regex (term.*) with exclude regex (termc): expect terma and termb
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "include": "term.*",
+                    "exclude": "termc",
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index)?;
+        assert_eq!(res["my_texts"]["buckets"][0]["key"], "terma");
+        assert_eq!(res["my_texts"]["buckets"][0]["doc_count"], 5);
+        assert_eq!(res["my_texts"]["buckets"][1]["key"], "termb");
+        assert_eq!(res["my_texts"]["buckets"][1]["doc_count"], 2);
+        assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
 
         // test min_doc_count
         let agg_req: Aggregations = serde_json::from_value(json!({
@@ -2100,6 +2273,145 @@ mod tests {
         assert_eq!(res["my_bool"]["buckets"][1]["key"], "127.0.0.1");
         assert_eq!(res["my_bool"]["buckets"][1]["doc_count"], 1);
         assert_eq!(res["my_bool"]["buckets"][2]["key"], serde_json::Value::Null);
+
+        Ok(())
+    }
+
+    #[test]
+    fn terms_aggs_hosts_and_tags_merge_on_mixed_order_request() -> crate::Result<()> {
+        // This test ensures that merging of aggregation results works correctly
+        // even if the order of the aggregation requests is different and
+        // running on different indexes with the same data.
+        let build_index = || -> crate::Result<Index> {
+            let mut schema_builder = Schema::builder();
+            let fielda = schema_builder.add_text_field("fielda", FAST);
+            let fieldb = schema_builder.add_text_field("fieldb", FAST);
+            let host = schema_builder.add_text_field("host", FAST);
+            let tags = schema_builder.add_text_field("tags", FAST);
+            let schema = schema_builder.build();
+
+            let index = Index::create_in_ram(schema.clone());
+            let mut writer = index.writer(50_000_000).unwrap();
+
+            // --- Ingest documents (batch #1) ---
+            writer.add_document(doc!(
+                host => "192.168.0.10",
+                tags => "nice",
+                fielda => "a",
+                fieldb => "b",
+            ))?;
+            writer.add_document(doc!(
+                host => "192.168.0.1",
+                tags => "nice",
+            ))?;
+            writer.add_document(doc!(
+                host => "192.168.0.11",
+                tags => "nice",
+            ))?;
+            writer.add_document(doc!(
+                host => "192.168.0.10",
+                tags => "nice",
+                tags => "cool",
+            ))?;
+            writer.add_document(doc!(
+                host => "192.168.0.1",
+                tags => "nice",
+                tags => "cool",
+            ))?;
+
+            writer.commit()?;
+
+            // --- Ingest documents (batch #2) ---
+            writer.add_document(doc!())?;
+            writer.add_document(doc!())?;
+            writer.add_document(doc!(
+                host => "192.168.0.10",
+            ))?;
+            writer.add_document(doc!(
+                host => "192.168.0.10",
+            ))?;
+            writer.add_document(doc!())?;
+
+            writer.commit()?;
+            Ok(index)
+        };
+        let index = build_index()?;
+        let index2 = build_index()?;
+
+        let search = |idx: &Index,
+                      agg_req: &Aggregations|
+         -> crate::Result<IntermediateAggregationResults> {
+            let collector = DistributedAggregationCollector::from_aggs(
+                agg_req.clone(),
+                AggregationLimitsGuard::default(),
+            );
+            let reader = idx.reader()?;
+            let searcher = reader.searcher();
+            let agg_res = searcher.search(&AllQuery, &collector)?;
+            Ok(agg_res)
+        };
+
+        // --- Aggregations: terms on host and tags ---
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "hosts": { "terms": { "field": "host" } },
+            "tags":  { "terms": { "field": "tags" } },
+            "fielda":  { "terms": { "field": "fielda" } },
+            "fieldb":  { "terms": { "field": "fieldb" } },
+        }))
+        .unwrap();
+
+        let mut agg_res = search(&index, &agg_req)?;
+
+        // --- Aggregations: terms on host and tags ---
+        let mut agg_req2: Aggregations =
+            Aggregations::with_capacity_and_hasher(20, Default::default());
+        agg_req2.insert(
+            "tags".to_string(),
+            serde_json::from_value(json!({ "terms": { "field": "tags" } }))?,
+        );
+        agg_req2.insert(
+            "fielda".to_string(),
+            serde_json::from_value(json!({ "terms": { "field": "fielda" } }))?,
+        );
+        agg_req2.insert(
+            "hosts".to_string(),
+            serde_json::from_value(json!({ "terms": { "field": "host" } }))?,
+        );
+        agg_req2.insert(
+            "fieldb".to_string(),
+            serde_json::from_value(json!({ "terms": { "field": "fieldb" } }))?,
+        );
+        // make sure the order of the aggregation request is different
+        // disabled to avoid flaky test with hashmap changes
+        // assert_ne!(agg_req.keys().next(), agg_req2.keys().next());
+
+        let agg_res2 = search(&index2, &agg_req2)?;
+
+        agg_res.merge_fruits(agg_res2).unwrap();
+        let agg_json = serde_json::to_value(
+            &agg_res.into_final_result(agg_req2, AggregationLimitsGuard::default())?,
+        )?;
+
+        // hosts:
+        let hosts = &agg_json["hosts"]["buckets"];
+        assert_eq!(hosts[0]["key"], "192.168.0.10");
+        assert_eq!(hosts[0]["doc_count"], 8);
+        assert_eq!(hosts[1]["key"], "192.168.0.1");
+        assert_eq!(hosts[1]["doc_count"], 4);
+        assert_eq!(hosts[2]["key"], "192.168.0.11");
+        assert_eq!(hosts[2]["doc_count"], 2);
+        // Implementation currently reports error bounds/other count; ensure zero.
+        assert_eq!(agg_json["hosts"]["doc_count_error_upper_bound"], 0);
+        assert_eq!(agg_json["hosts"]["sum_other_doc_count"], 0);
+
+        // tags:
+        let tags_buckets = &agg_json["tags"]["buckets"];
+        assert_eq!(tags_buckets[0]["key"], "nice");
+        assert_eq!(tags_buckets[0]["doc_count"], 10);
+        assert_eq!(tags_buckets[1]["key"], "cool");
+        assert_eq!(tags_buckets[1]["doc_count"], 4);
+        assert_eq!(agg_json["tags"]["doc_count_error_upper_bound"], 0);
+        assert_eq!(agg_json["tags"]["sum_other_doc_count"], 0);
 
         Ok(())
     }
