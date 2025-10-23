@@ -5,7 +5,7 @@ const NS_IN_DAY: i64 = Nanosecond::per_t::<i128>(Day) as i64;
 
 /// Computes the timestamp in nanoseconds corresponding to the beginning of the
 /// year (January 1st at midnight UTC)
-pub fn try_year_bucket(timestamp_ns: i64) -> crate::Result<i64> {
+pub(super) fn try_year_bucket(timestamp_ns: i64) -> crate::Result<i64> {
     year_bucket_using_time_crate(timestamp_ns).map_err(|e| {
         crate::TantivyError::InvalidArgument(format!(
             "Failed to compute year bucket for timestamp {}: {}",
@@ -17,7 +17,7 @@ pub fn try_year_bucket(timestamp_ns: i64) -> crate::Result<i64> {
 
 /// Computes the timestamp in nanoseconds corresponding to the beginning of the
 /// month (1st at midnight UTC)
-pub fn try_month_bucket(timestamp_ns: i64) -> crate::Result<i64> {
+pub(super) fn try_month_bucket(timestamp_ns: i64) -> crate::Result<i64> {
     month_bucket_using_time_crate(timestamp_ns).map_err(|e| {
         crate::TantivyError::InvalidArgument(format!(
             "Failed to compute month bucket for timestamp {}: {}",
@@ -29,7 +29,7 @@ pub fn try_month_bucket(timestamp_ns: i64) -> crate::Result<i64> {
 
 /// Computes the timestamp in nanoseconds corresponding to the beginning of the
 /// week (Monday at midnight UTC)
-pub fn week_bucket(timestamp_ns: i64) -> i64 {
+pub(super) fn week_bucket(timestamp_ns: i64) -> i64 {
     // 1970-01-01 was a Thursday (weekday = 4)
     let days_since_epoch = timestamp_ns.div_euclid(NS_IN_DAY);
     // Find the weekday: 0=Monday, ..., 6=Sunday

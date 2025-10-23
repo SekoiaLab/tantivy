@@ -28,7 +28,8 @@ use crate::aggregation::agg_result::{
     AggregationResults, BucketEntries, BucketEntry, CompositeBucketEntry,
 };
 use crate::aggregation::bucket::{
-    composite_ordering, CompositeAggregation, MissingOrder, TermsAggregationInternal,
+    composite_intermediate_key_ordering, CompositeAggregation, MissingOrder,
+    TermsAggregationInternal,
 };
 use crate::aggregation::metric::CardinalityCollector;
 use crate::TantivyError;
@@ -837,10 +838,49 @@ pub struct IntermediateTermBucketEntry {
 /// Entry for the composite bucket.
 pub type IntermediateCompositeBucketEntry = IntermediateTermBucketEntry;
 
+/// The fully typed key for composite aggregation
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum CompositeIntermediateKey {
+    /// Bool key
+    Bool(bool),
+    /// String key
+    Str(String),
+    /// Float key
+    F64(f64),
+    /// Signed integer key
+    I64(i64),
+    /// Unsigned integer key
+    U64(u64),
+    /// DateTime key
+    DateTime(i64),
+    /// IP Address key
+    IpAddr(Ipv6Addr),
+    /// Missing value key
+    Null,
+}
+
+impl Eq for CompositeIntermediateKey {}
+
+impl std::hash::Hash for CompositeIntermediateKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+        match self {
+            CompositeIntermediateKey::Bool(val) => val.hash(state),
+            CompositeIntermediateKey::Str(text) => text.hash(state),
+            CompositeIntermediateKey::F64(val) => val.to_bits().hash(state),
+            CompositeIntermediateKey::U64(val) => val.hash(state),
+            CompositeIntermediateKey::I64(val) => val.hash(state),
+            CompositeIntermediateKey::DateTime(val) => val.hash(state),
+            CompositeIntermediateKey::IpAddr(val) => val.hash(state),
+            CompositeIntermediateKey::Null => {}
+        }
+    }
+}
+
 /// Composite aggregation page.
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IntermediateCompositeBucketResult {
-    pub(crate) entries: FxHashMap<Vec<Option<IntermediateKey>>, IntermediateCompositeBucketEntry>,
+    pub(crate) entries: FxHashMap<Vec<CompositeIntermediateKey>, IntermediateCompositeBucketEntry>,
     pub(crate) target_size: u32,
     pub(crate) orders: Vec<(Order, MissingOrder)>,
 }
@@ -853,7 +893,7 @@ impl IntermediateCompositeBucketResult {
         limits: &mut AggregationLimitsGuard,
     ) -> crate::Result<BucketResult> {
         let trimmed_entry_vec =
-            trim_composite_buckets(self.entries, &self.orders, self.target_size);
+            trim_composite_buckets(self.entries, &self.orders, self.target_size)?;
         let buckets = trimmed_entry_vec
             .into_iter()
             .map(|(intermediate_key, entry)| {
@@ -862,10 +902,7 @@ impl IntermediateCompositeBucketResult {
                     .enumerate()
                     .map(|(idx, intermediate_key)| {
                         let source = &req.sources[idx];
-                        (
-                            source.name().to_string(),
-                            intermediate_key.map(|k| k.into()),
-                        )
+                        (source.name().to_string(), intermediate_key.into())
                     })
                     .collect();
                 Ok(CompositeBucketEntry {
@@ -889,49 +926,76 @@ impl IntermediateCompositeBucketResult {
 
     fn merge_fruits(&mut self, other: IntermediateCompositeBucketResult) -> crate::Result<()> {
         merge_maps(&mut self.entries, other.entries)?;
-        self.trim();
+        if self.entries.len() as u32 > 2 * self.target_size {
+            // 2x factor used to avoid trimming too often (expensive operation)
+            // an optimal threshold could probably be figured out
+            self.trim()?;
+        }
         Ok(())
     }
 
     /// Trim the composite buckets to the target size, according to the ordering.
-    pub(crate) fn trim(&mut self) {
-        // TODO: this requires draining the existing map, sorting, truncating,
-        // and re-building a new hashmap. We might want to only do it if the
-        // map is much larger than the target (2x ?).
+    ///
+    /// Returns an error if the ordering comparison fails.
+    pub(crate) fn trim(&mut self) -> crate::Result<()> {
         if self.entries.len() as u32 <= self.target_size {
-            return;
+            return Ok(());
         }
-        self.entries = trim_composite_buckets(
+
+        let sorted_entries = trim_composite_buckets(
             std::mem::take(&mut self.entries),
             &self.orders,
             self.target_size,
-        )
-        .into_iter()
-        .collect();
+        )?;
+
+        self.entries = sorted_entries.into_iter().collect();
+        Ok(())
     }
 }
 
 fn trim_composite_buckets(
-    entries: FxHashMap<Vec<Option<IntermediateKey>>, IntermediateCompositeBucketEntry>,
+    entries: FxHashMap<Vec<CompositeIntermediateKey>, IntermediateCompositeBucketEntry>,
     orders: &[(Order, MissingOrder)],
     target_size: u32,
-) -> Vec<(
-    Vec<Option<IntermediateKey>>,
-    IntermediateCompositeBucketEntry,
-)> {
+) -> crate::Result<
+    Vec<(
+        Vec<CompositeIntermediateKey>,
+        IntermediateCompositeBucketEntry,
+    )>,
+> {
     let mut entries: Vec<_> = entries.into_iter().collect();
+    let mut sort_error: Option<TantivyError> = None;
     entries.sort_by(|(left_key, _), (right_key, _)| {
+        // Only attempt sorting if we haven't encountered an error yet
+        if sort_error.is_some() {
+            return Ordering::Equal; // Return a default, we'll handle the error after sorting
+        }
+
         for i in 0..orders.len() {
-            let ordering =
-                composite_ordering(&left_key[i], &right_key[i], orders[i].0, orders[i].1);
-            if ordering != Ordering::Equal {
-                return ordering;
+            match composite_intermediate_key_ordering(
+                &left_key[i],
+                &right_key[i],
+                orders[i].0,
+                orders[i].1,
+            ) {
+                Ok(ordering) if ordering != Ordering::Equal => return ordering,
+                Ok(_) => continue, // Equal, try next key
+                Err(err) => {
+                    sort_error = Some(err);
+                    break;
+                }
             }
         }
         Ordering::Equal
     });
+
+    // If we encountered an error during sorting, return it now
+    if let Some(err) = sort_error {
+        return Err(err);
+    }
+
     entries.truncate(target_size as usize);
-    entries
+    Ok(entries)
 }
 
 impl MergeFruits for IntermediateTermBucketEntry {

@@ -2,7 +2,9 @@ mod accessors;
 mod calendar_interval;
 mod collector;
 mod map;
+mod numeric_types;
 
+use core::panic;
 use std::cmp::Ordering;
 use std::fmt::Debug;
 
@@ -14,9 +16,12 @@ pub use crate::aggregation::bucket::composite::accessors::{
     CompositeAccessor, CompositeAggReqData, CompositeSourceAccessors, PrecomputedDateInterval,
 };
 pub use crate::aggregation::bucket::composite::collector::SegmentCompositeCollector;
+use crate::aggregation::bucket::composite::numeric_types::num_cmp::{
+    cmp_i64_f64, cmp_i64_u64, cmp_u64_f64,
+};
 use crate::aggregation::bucket::Order;
 use crate::aggregation::deserialize_f64;
-use crate::aggregation::intermediate_agg_result::IntermediateKey;
+use crate::aggregation::intermediate_agg_result::CompositeIntermediateKey;
 use crate::TantivyError;
 
 /// The position of missing keys in the ordering
@@ -190,7 +195,7 @@ pub struct CompositeAggregation {
     /// Number of buckets to return (page size)
     pub size: u32,
     /// The key of the last bucket from the previous page
-    pub after: FxHashMap<String, Option<CompositeKey>>,
+    pub after: FxHashMap<String, CompositeKey>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -198,7 +203,7 @@ struct CompositeAggregationSerde {
     sources: Vec<FxHashMap<String, CompositeAggregationSource>>,
     size: u32,
     #[serde(default, skip_serializing_if = "FxHashMap::is_empty")]
-    after: FxHashMap<String, Option<CompositeKey>>,
+    after: FxHashMap<String, CompositeKey>,
 }
 
 impl TryFrom<CompositeAggregationSerde> for CompositeAggregation {
@@ -265,35 +270,81 @@ impl From<CompositeAggregation> for CompositeAggregationSerde {
     }
 }
 
+fn type_order_key(key: &CompositeIntermediateKey, order: Order) -> i32 {
+    let apply_order = match order {
+        Order::Asc => 1,
+        Order::Desc => -1,
+    };
+    match key {
+        CompositeIntermediateKey::Null => panic!("unexpected"),
+        CompositeIntermediateKey::Bool(_) => 1 * apply_order,
+        CompositeIntermediateKey::Str(_) => 2 * apply_order,
+        CompositeIntermediateKey::I64(_) => 3 * apply_order,
+        CompositeIntermediateKey::F64(_) => 3 * apply_order,
+        CompositeIntermediateKey::U64(_) => 3 * apply_order,
+        CompositeIntermediateKey::IpAddr(_) => 4,
+        CompositeIntermediateKey::DateTime(_) => 4,
+    }
+}
+
 /// Calculates the ordering between (potentially missing) intermediate keys
-pub fn composite_ordering(
-    left_opt: &Option<IntermediateKey>,
-    right_opt: &Option<IntermediateKey>,
+pub fn composite_intermediate_key_ordering(
+    left_opt: &CompositeIntermediateKey,
+    right_opt: &CompositeIntermediateKey,
     order: Order,
     missing_order: MissingOrder,
-) -> Ordering {
-    match (left_opt, right_opt) {
-        (Some(left), Some(right)) => {
-            // only floats are not totally ordered, let's not care about NaN/Inf here
-            let ord = left.partial_cmp(&right).unwrap_or(Ordering::Equal);
-            match order {
-                Order::Asc => ord,
-                Order::Desc => ord.reverse(),
+) -> crate::Result<Ordering> {
+    use CompositeIntermediateKey as CIKey;
+    let mut forced_ordering = false;
+    let asc_ordering = match (left_opt, right_opt) {
+        // null comparisons
+        (CIKey::Null, CIKey::Null) => Ordering::Equal,
+        (CIKey::Null, _) => {
+            forced_ordering = missing_order != MissingOrder::Default;
+            match missing_order {
+                MissingOrder::First => Ordering::Less,
+                MissingOrder::Last => Ordering::Greater,
+                MissingOrder::Default => Ordering::Less,
             }
         }
-        (None, Some(_)) => match (missing_order, order) {
-            (MissingOrder::First, _) => Ordering::Less,
-            (MissingOrder::Last, _) => Ordering::Greater,
-            (MissingOrder::Default, Order::Asc) => Ordering::Less,
-            (MissingOrder::Default, Order::Desc) => Ordering::Greater,
-        },
-        (Some(_), None) => match (missing_order, order) {
-            (MissingOrder::First, _) => Ordering::Greater,
-            (MissingOrder::Last, _) => Ordering::Less,
-            (MissingOrder::Default, Order::Asc) => Ordering::Greater,
-            (MissingOrder::Default, Order::Desc) => Ordering::Less,
-        },
-        (None, None) => Ordering::Equal,
+        (_, CIKey::Null) => {
+            forced_ordering = missing_order != MissingOrder::Default;
+            match missing_order {
+                MissingOrder::First => Ordering::Greater,
+                MissingOrder::Last => Ordering::Less,
+                MissingOrder::Default => Ordering::Greater,
+            }
+        }
+        // same type comparisons
+        (CIKey::Bool(left), CIKey::Bool(right)) => left.cmp(right),
+        (CIKey::I64(left), CIKey::I64(right)) => left.cmp(right),
+        (CIKey::Str(left), CIKey::Str(right)) => left.cmp(right),
+        (CIKey::IpAddr(left), CIKey::IpAddr(right)) => left.cmp(right),
+        (CIKey::DateTime(left), CIKey::DateTime(right)) => left.cmp(right),
+        (CIKey::U64(left), CIKey::U64(right)) => left.cmp(right),
+        (CIKey::F64(f), CIKey::F64(_)) | (CIKey::F64(_), CIKey::F64(f)) if f.is_nan() => {
+            return Err(TantivyError::InvalidArgument(
+                "NaN comparison is not supported".to_string(),
+            ))
+        }
+        (CIKey::F64(left), CIKey::F64(right)) => left.partial_cmp(right).unwrap_or(Ordering::Equal),
+        // numeric cross-type comparisons
+        (CIKey::F64(left), CIKey::I64(right)) => cmp_i64_f64(*right, *left)?.reverse(),
+        (CIKey::F64(left), CIKey::U64(right)) => cmp_u64_f64(*right, *left)?.reverse(),
+        (CIKey::I64(left), CIKey::F64(right)) => cmp_i64_f64(*left, *right)?,
+        (CIKey::I64(left), CIKey::U64(right)) => cmp_i64_u64(*left, *right),
+        (CIKey::U64(left), CIKey::I64(right)) => cmp_i64_u64(*right, *left).reverse(),
+        (CIKey::U64(left), CIKey::F64(right)) => cmp_u64_f64(*left, *right)?,
+        // other cross-type comparisons
+        (type_a, type_b) => {
+            forced_ordering = true;
+            type_order_key(type_a, order).cmp(&type_order_key(type_b, order))
+        }
+    };
+    if !forced_ordering && order == Order::Desc {
+        Ok(asc_ordering.reverse())
+    } else {
+        Ok(asc_ordering)
     }
 }
 
@@ -324,7 +375,8 @@ mod tests {
     }
 
     /// Runs the query and compares the result buckets to the expected buckets,
-    /// then run the same query with all possible `after` keys.
+    /// then run the same query with a all possible `after` keys and different
+    /// page sizes.
     fn exec_and_assert_all_paginations(
         index: &Index,
         composite_agg_req: serde_json::Value,
@@ -340,7 +392,10 @@ mod tests {
         let buckets = &res["my_composite"]["buckets"];
         assert_eq!(buckets, &expected_buckets);
 
-        // check that all returned values can be used as after key
+        // Check that all returned buckets can be used as after key
+        // Note: this is not a requirement of the API, only the key explicitly
+        // returned as after_key is guaranteed to work, but this is a nice
+        // property of the implementation.
         for (i, expected_bucket) in expected_buckets.as_array().unwrap().iter().enumerate() {
             let new_composite_agg_req = json!({
                 "sources": composite_agg_req["sources"].clone(),
@@ -357,10 +412,59 @@ mod tests {
             assert_eq!(
                 &paginated_res["my_composite"]["buckets"],
                 &json!(&expected_buckets.as_array().unwrap()[i + 1..]),
-                "query with after key failed: {}",
+                "query with after key from bucket failed: {}",
                 new_composite_agg_req.to_string()
             );
         }
+
+        // paginate 1 by 1
+        let one_by_one_composite_agg_req = json!({
+            "sources": composite_agg_req["sources"].clone(),
+            "size": 1,
+        });
+        let mut after_key = None;
+        for i in 0..expected_buckets.as_array().unwrap().len() {
+            let mut paged_req = one_by_one_composite_agg_req.clone();
+            if let Some(after_key) = after_key {
+                paged_req["after"] = after_key;
+            }
+            let agg_req: Aggregations = serde_json::from_value(json!({
+                "my_composite": {
+                    "composite": paged_req
+                }
+            }))
+            .unwrap();
+            let paged_res = exec_request(agg_req, &index).unwrap();
+            assert_eq!(
+                &paged_res["my_composite"]["buckets"],
+                &json!(&[&expected_buckets[i]]),
+                "1-by-1 pagination failed at index {}, query: {}",
+                i,
+                paged_req.to_string()
+            );
+            after_key = paged_res["my_composite"].get("after_key").cloned();
+        }
+        // Ideally, we should not require the user to issue an extra request
+        // because we could know that this is the last page.
+        if let Some(last_after_key) = after_key {
+            let mut last_page_req = one_by_one_composite_agg_req.clone();
+            last_page_req["after"] = last_after_key;
+            let agg_req: Aggregations = serde_json::from_value(json!({
+                "my_composite": {
+                    "composite": last_page_req
+                }
+            }))
+            .unwrap();
+            let paged_res = exec_request(agg_req, &index).unwrap();
+            assert_eq!(
+                &paged_res["my_composite"]["buckets"],
+                &json!([]),
+                "last page request failed, query: {}",
+                last_page_req.to_string()
+            );
+            after_key = paged_res["my_composite"].get("after_key").cloned();
+        }
+        assert_eq!(after_key, None);
     }
 
     fn composite_aggregation_test(merge_segments: bool) -> crate::Result<()> {
@@ -937,7 +1041,9 @@ mod tests {
             index_writer.add_document(doc!(score_field => 1.0f64))?;
             index_writer.add_document(doc!(score_field => 2.0f64))?;
             index_writer.add_document(doc!(score_field => 1.0f64))?;
-            index_writer.add_document(doc!(score_field => 3f64))?;
+            index_writer.add_document(doc!(score_field => 3.33f64))?;
+            index_writer.commit()?;
+            index_writer.add_document(doc!(score_field => 1.0f64))?;
             index_writer.commit()?;
         }
 
@@ -951,9 +1057,9 @@ mod tests {
                 "size": 10
             }),
             json!([
-                {"key": {"score": 1}, "doc_count": 2},
+                {"key": {"score": 1}, "doc_count": 3},
                 {"key": {"score": 2}, "doc_count": 1},
-                {"key": {"score": 3}, "doc_count": 1}
+                {"key": {"score": 3.33}, "doc_count": 1}
             ]),
         );
 
@@ -1210,12 +1316,17 @@ mod tests {
         {
             let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
             index_writer.add_document(doc!(json_field => json!({"id": "doc1"})))?;
+            // this segment's numeric is i64
             index_writer.add_document(doc!(json_field => json!({"id": 100})))?;
             index_writer.add_document(doc!(json_field => json!({"id": true})))?;
             index_writer.add_document(doc!(json_field => json!({"id": "doc2"})))?;
             index_writer.add_document(doc!(json_field => json!({"id": 50})))?;
             index_writer.add_document(doc!(json_field => json!({"id": false})))?;
             index_writer.add_document(doc!(json_field => json!({"id": "doc3"})))?;
+            index_writer.commit()?;
+            // this segment's numeric is f64
+            index_writer.add_document(doc!(json_field => json!({"id": 33.3})))?;
+            index_writer.add_document(doc!(json_field => json!({"id": 50})))?;
             index_writer.commit()?;
         }
 
@@ -1233,7 +1344,8 @@ mod tests {
                 {"key": {"id": "doc1"}, "doc_count": 1},
                 {"key": {"id": "doc2"}, "doc_count": 1},
                 {"key": {"id": "doc3"}, "doc_count": 1},
-                {"key": {"id": 50}, "doc_count": 1},
+                {"key": {"id": 33.3}, "doc_count": 1},
+                {"key": {"id": 50}, "doc_count": 2},
                 {"key": {"id": 100}, "doc_count": 1}
             ]),
         );
@@ -1249,7 +1361,8 @@ mod tests {
             }),
             json!([
                 {"key": {"id": 100}, "doc_count": 1},
-                {"key": {"id": 50}, "doc_count": 1},
+                {"key": {"id": 50}, "doc_count": 2},
+                {"key": {"id": 33.3}, "doc_count": 1},
                 {"key": {"id": "doc3"}, "doc_count": 1},
                 {"key": {"id": "doc2"}, "doc_count": 1},
                 {"key": {"id": "doc1"}, "doc_count": 1},

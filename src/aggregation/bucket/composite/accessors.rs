@@ -9,6 +9,8 @@ use crate::aggregation::agg_req_with_accessor::{
     get_all_ff_readers, get_numeric_or_date_column_types,
 };
 use crate::aggregation::agg_result::CompositeKey;
+use crate::aggregation::bucket::composite::numeric_types::num_proj;
+use crate::aggregation::bucket::composite::numeric_types::num_proj::ProjectedNumber;
 use crate::aggregation::bucket::{
     parse_into_milliseconds, CalendarInterval, CompositeAggregation, CompositeAggregationSource,
     MissingOrder, Order,
@@ -76,13 +78,20 @@ impl CompositeSourceAccessors {
         // First option is None when no after key was set in the query, the
         // second option is None when the after key was set but its value for
         // this source was set to `null`
-        source_after_key_opt: Option<&Option<CompositeKey>>,
+        source_after_key_opt: Option<&CompositeKey>,
     ) -> crate::Result<Self> {
         let is_after_key_explicit_missing = source_after_key_opt
-            .map(|after_key| after_key.is_none())
+            .map(|after_key| matches!(after_key, CompositeKey::Null))
             .unwrap_or(false);
         let mut skip_missing = !source.missing_bucket();
-        if let Some(Some(_)) = source_after_key_opt {
+        if let Some(CompositeKey::Null) = source_after_key_opt {
+            if !source.missing_bucket() {
+                return Err(TantivyError::InvalidArgument(
+                    "the 'after' key for a source cannot be null when 'missing_bucket' is false"
+                        .to_string(),
+                ));
+            }
+        } else if source_after_key_opt.is_some() {
             // if missing buckets come first and we have a non null after key, we skip missing
             if MissingOrder::First == source.missing_order() {
                 skip_missing = true;
@@ -91,6 +100,7 @@ impl CompositeSourceAccessors {
                 skip_missing = true;
             }
         };
+
         match source {
             CompositeAggregationSource::Terms(source) => {
                 let allowed_column_types = [
@@ -113,7 +123,6 @@ impl CompositeSourceAccessors {
                     after_key_accessor_idx = skip_for_key(
                         &columns_and_types,
                         &source_after_key_explicit_opt,
-                        source.missing_bucket,
                         source.missing_order,
                         source.order,
                     )?;
@@ -135,15 +144,13 @@ impl CompositeSourceAccessors {
                     source_collectors.get(after_key_accessor_idx)
                 {
                     match source_after_key_opt {
-                        Some(Some(after_key)) => PrecomputedAfterKey::precompute(
+                        Some(after_key) => PrecomputedAfterKey::precompute(
                             &first_col,
                             after_key,
                             &source.field,
+                            source.missing_order,
                             source.order,
                         )?,
-                        Some(None) => {
-                            precompute_missing_after_key(true, source.missing_order, source.order)
-                        }
                         None => {
                             precompute_missing_after_key(false, source.missing_order, source.order)
                         }
@@ -179,16 +186,16 @@ impl CompositeSourceAccessors {
                     })
                     .collect::<crate::Result<_>>()?;
                 let after_key = match source_after_key_opt {
-                    Some(Some(CompositeKey::I64(key))) => {
+                    Some(CompositeKey::I64(key)) => {
                         PrecomputedAfterKey::Exact((*key as f64).to_u64())
                     }
-                    Some(Some(CompositeKey::U64(key))) => {
+                    Some(CompositeKey::U64(key)) => {
                         PrecomputedAfterKey::Exact((*key as f64).to_u64())
                     }
-                    Some(Some(CompositeKey::F64(key))) => {
+                    Some(CompositeKey::F64(key)) => {
                         PrecomputedAfterKey::Exact((*key as f64).to_u64())
                     }
-                    Some(None) => {
+                    Some(CompositeKey::Null) => {
                         precompute_missing_after_key(true, source.missing_order, source.order)
                     }
                     None => precompute_missing_after_key(true, source.missing_order, source.order),
@@ -226,8 +233,8 @@ impl CompositeSourceAccessors {
                     })
                     .collect::<crate::Result<_>>()?;
                 let after_key = match source_after_key_opt {
-                    Some(Some(CompositeKey::I64(key))) => PrecomputedAfterKey::Exact(key.to_u64()),
-                    Some(None) => {
+                    Some(CompositeKey::I64(key)) => PrecomputedAfterKey::Exact(key.to_u64()),
+                    Some(CompositeKey::Null) => {
                         precompute_missing_after_key(true, source.missing_order, source.order)
                     }
                     None => precompute_missing_after_key(true, source.missing_order, source.order),
@@ -252,6 +259,8 @@ impl CompositeSourceAccessors {
 /// Sort orders:
 /// - Asc: Bool->Str->F64/I64/U64->DateTime/IpAddr
 /// - Desc: U64/I64/F64->Str->Bool->DateTime/IpAddr
+///
+/// Should be aligned with [super::type_order_key]
 fn col_type_order_key(col_type: &ColumnType, composite_order: Order) -> i32 {
     let apply_order = match composite_order {
         Order::Asc => 1,
@@ -273,49 +282,48 @@ fn col_type_order_key(col_type: &ColumnType, composite_order: Order) -> i32 {
     }
 }
 
-// The column type order key until which we should skip columns (exclusive)
-fn skip_until_col_type_order_key(key: &CompositeKey, order: Order) -> i32 {
-    match (key, order) {
-        // Asc: Bool->Str->F64/I64/U64->DateTime/IpAddr
-        (CompositeKey::Bool(_), Order::Asc) => 1,
-        (CompositeKey::Str(_), Order::Asc) => 2,
-        (CompositeKey::F64(_) | CompositeKey::I64(_) | CompositeKey::U64(_), Order::Asc) => 3,
-        // Desc: U64/I64/F64->Str->Bool->DateTime/IpAddr
-        (CompositeKey::F64(_) | CompositeKey::I64(_) | CompositeKey::U64(_), Order::Desc) => -3,
-        (CompositeKey::Str(_), Order::Desc) => -2,
-        (CompositeKey::Bool(_), Order::Desc) => -1,
+fn find_skip_idx<T>(
+    columns_and_types: &Vec<(T, ColumnType)>,
+    order: Order,
+    skip_until_col_type_order_key: i32,
+) -> crate::Result<usize> {
+    for (idx, (_, col_type)) in columns_and_types.iter().enumerate() {
+        let col_type_order = col_type_order_key(col_type, order);
+        if col_type_order >= skip_until_col_type_order_key {
+            return Ok(idx);
+        }
     }
+    Ok(columns_and_types.len())
 }
 
 fn skip_for_key<T>(
     columns_and_types: &Vec<(T, ColumnType)>,
-    after_key_opt: &Option<CompositeKey>,
-    missing_bucket: bool,
+    after_key: &CompositeKey,
     missing_order: MissingOrder,
     order: Order,
 ) -> crate::Result<usize> {
-    if let Some(source_after_key) = after_key_opt {
-        let skip_until_key = skip_until_col_type_order_key(source_after_key, order);
-        for (idx, (_, col_type)) in columns_and_types.iter().enumerate() {
-            let col_type_order = col_type_order_key(col_type, order);
-            if col_type_order >= skip_until_key {
-                return Ok(idx);
-            }
+    match (after_key, order) {
+        // Asc: Bool->Str->F64/I64/U64->DateTime/IpAddr
+        (CompositeKey::Bool(_), Order::Asc) => find_skip_idx(columns_and_types, order, 1),
+        (CompositeKey::Str(_), Order::Asc) => find_skip_idx(columns_and_types, order, 2),
+        (CompositeKey::F64(_) | CompositeKey::I64(_) | CompositeKey::U64(_), Order::Asc) => {
+            find_skip_idx(columns_and_types, order, 3)
         }
-        Ok(columns_and_types.len())
-    } else if !missing_bucket {
-        Err(TantivyError::InvalidArgument(
-            "the 'after' key for a source cannot be null when 'missing_bucket' is false"
-                .to_string(),
-        ))
-    } else {
-        match (missing_order, order) {
-            (MissingOrder::First, _) | (MissingOrder::Default, Order::Asc) => {
-                Ok(0) // don't skip any columns
-            }
-            (MissingOrder::Last, _) | (MissingOrder::Default, Order::Desc) => {
-                // all columns are skipped
-                Ok(columns_and_types.len())
+        // Desc: U64/I64/F64->Str->Bool->DateTime/IpAddr
+        (CompositeKey::F64(_) | CompositeKey::I64(_) | CompositeKey::U64(_), Order::Desc) => {
+            find_skip_idx(columns_and_types, order, -3)
+        }
+        (CompositeKey::Str(_), Order::Desc) => find_skip_idx(columns_and_types, order, -2),
+        (CompositeKey::Bool(_), Order::Desc) => find_skip_idx(columns_and_types, order, -1),
+        (CompositeKey::Null, _) => {
+            match (missing_order, order) {
+                (MissingOrder::First, _) | (MissingOrder::Default, Order::Asc) => {
+                    Ok(0) // don't skip any columns
+                }
+                (MissingOrder::Last, _) | (MissingOrder::Default, Order::Desc) => {
+                    // all columns are skipped
+                    Ok(columns_and_types.len())
+                }
             }
         }
     }
@@ -375,7 +383,7 @@ impl PrecomputedDateInterval {
     }
 }
 
-/// The after key projected to the column space
+/// The after key projected to the u64 column space
 ///
 /// Some column types (term, IP) might not have an exact representation of the
 /// specified after key
@@ -386,12 +394,16 @@ pub enum PrecomputedAfterKey {
     /// The after key could not be exactly represented exactly represented, so
     /// this is the next closest one.
     Next(u64),
+    /// The after key could not be represented in the column space, it is
+    /// greater than all value
+    AfterLast,
 }
 
 impl From<TermOrdHit> for PrecomputedAfterKey {
     fn from(hit: TermOrdHit) -> Self {
         match hit {
             TermOrdHit::Exact(ord) => PrecomputedAfterKey::Exact(ord),
+            // TermOrdHit represents AfterLast as Next(u64::MAX), we keep it as is
             TermOrdHit::Next(ord) => PrecomputedAfterKey::Next(ord),
         }
     }
@@ -402,7 +414,17 @@ impl From<CompactHit> for PrecomputedAfterKey {
         match hit {
             CompactHit::Exact(ord) => PrecomputedAfterKey::Exact(ord as u64),
             CompactHit::Next(ord) => PrecomputedAfterKey::Next(ord as u64),
-            CompactHit::AfterLast => PrecomputedAfterKey::Next(u64::MAX),
+            CompactHit::AfterLast => PrecomputedAfterKey::AfterLast,
+        }
+    }
+}
+
+impl<T: MonotonicallyMappableToU64> From<ProjectedNumber<T>> for PrecomputedAfterKey {
+    fn from(num: ProjectedNumber<T>) -> Self {
+        match num {
+            ProjectedNumber::Exact(number) => PrecomputedAfterKey::Exact(number.to_u64()),
+            ProjectedNumber::Next(number) => PrecomputedAfterKey::Next(number.to_u64()),
+            ProjectedNumber::AfterLast => PrecomputedAfterKey::AfterLast,
         }
     }
 }
@@ -413,6 +435,7 @@ impl PrecomputedAfterKey {
         match self {
             PrecomputedAfterKey::Exact(v) => *v == column_value,
             PrecomputedAfterKey::Next(_) => false,
+            PrecomputedAfterKey::AfterLast => false,
         }
     }
 
@@ -420,6 +443,7 @@ impl PrecomputedAfterKey {
         match self {
             PrecomputedAfterKey::Exact(v) => *v > column_value,
             PrecomputedAfterKey::Next(v) => *v > column_value,
+            PrecomputedAfterKey::AfterLast => true,
         }
     }
 
@@ -428,85 +452,41 @@ impl PrecomputedAfterKey {
             PrecomputedAfterKey::Exact(v) => *v < column_value,
             // a value equal to the next is greater than the after key
             PrecomputedAfterKey::Next(v) => *v <= column_value,
+            PrecomputedAfterKey::AfterLast => false,
         }
     }
 
-    fn precompute_i64(key: &CompositeKey, order: Order) -> Self {
+    fn precompute_i64(key: &CompositeKey, missing_order: MissingOrder, order: Order) -> Self {
         // avoid rough casting
         match key {
             CompositeKey::I64(k) => PrecomputedAfterKey::Exact(k.to_u64()),
-            CompositeKey::U64(k) if k > &(i64::MAX as u64) => {
-                // TODO is this ok?
-                PrecomputedAfterKey::Next(i64::MAX.to_u64())
-            }
-            CompositeKey::U64(k) => PrecomputedAfterKey::Exact((*k as i64).to_u64()),
-            CompositeKey::F64(k) => {
-                let k_ceiled = k.ceil() as f64;
-                if k_ceiled == *k {
-                    PrecomputedAfterKey::Exact((k_ceiled as i64).to_u64())
-                } else {
-                    PrecomputedAfterKey::Next((k_ceiled as i64).to_u64())
-                }
-            }
+            CompositeKey::U64(k) => num_proj::u64_to_i64(*k).into(),
+            CompositeKey::F64(k) => num_proj::f64_to_i64(*k).into(),
             CompositeKey::Bool(_) => Self::keep_all(order),
             CompositeKey::Str(_) => Self::keep_all(order),
+            CompositeKey::Null => precompute_missing_after_key(false, missing_order, order),
         }
     }
 
-    fn precompute_u64(key: &CompositeKey, order: Order) -> Self {
+    fn precompute_u64(key: &CompositeKey, missing_order: MissingOrder, order: Order) -> Self {
         match key {
-            CompositeKey::I64(k) => {
-                if *k < 0 {
-                    PrecomputedAfterKey::Next(0)
-                } else {
-                    PrecomputedAfterKey::Exact(*k as u64)
-                }
-            }
+            CompositeKey::I64(k) => num_proj::i64_to_u64(*k).into(),
             CompositeKey::U64(k) => PrecomputedAfterKey::Exact(*k),
-            CompositeKey::F64(k) => {
-                if *k < 0.0 {
-                    PrecomputedAfterKey::Next(0)
-                } else if *k > u64::MAX as f64 {
-                    // TODO is this ok?
-                    PrecomputedAfterKey::Next(u64::MAX)
-                } else if k.fract() != 0.0 {
-                    PrecomputedAfterKey::Next(k.ceil() as u64)
-                } else if !k.is_finite() {
-                    panic!("unexpected non-finite f64 value in after_key");
-                } else {
-                    PrecomputedAfterKey::Exact(*k as u64)
-                }
-            }
+            CompositeKey::F64(k) => num_proj::f64_to_u64(*k).into(),
             CompositeKey::Bool(_) => Self::keep_all(order),
             CompositeKey::Str(_) => Self::keep_all(order),
+            CompositeKey::Null => precompute_missing_after_key(false, missing_order, order),
         }
     }
 
-    fn precompute_f64(key: &CompositeKey, order: Order) -> Self {
+    fn precompute_f64(key: &CompositeKey, missing_order: MissingOrder, order: Order) -> Self {
         match key {
             CompositeKey::F64(k) => PrecomputedAfterKey::Exact(k.to_u64()),
-            CompositeKey::I64(k) => {
-                let k_roundtrip = (*k as f64) as i64;
-                if k_roundtrip == *k {
-                    PrecomputedAfterKey::Exact((*k as f64).to_u64())
-                } else if k_roundtrip > *k {
-                    PrecomputedAfterKey::Next((*k as f64).to_u64())
-                } else {
-                    PrecomputedAfterKey::Next(((*k + 1) as f64).to_u64())
-                }
-            }
-            CompositeKey::U64(k) => {
-                let k_roundtrip = (*k as f64) as u64;
-                if k_roundtrip == *k {
-                    PrecomputedAfterKey::Exact((*k as f64).to_u64())
-                } else if k_roundtrip > *k {
-                    PrecomputedAfterKey::Next((*k as f64).to_u64())
-                } else {
-                    PrecomputedAfterKey::Next(((*k + 1) as f64).to_u64())
-                }
-            }
+            CompositeKey::I64(k) => num_proj::i64_to_f64(*k).into(),
+            CompositeKey::U64(k) => num_proj::u64_to_f64(*k).into(),
             CompositeKey::Bool(_) => Self::keep_all(order),
             CompositeKey::Str(_) => Self::keep_all(order),
+            CompositeKey::Null => precompute_missing_after_key(false, missing_order, order),
         }
     }
 
@@ -556,19 +536,38 @@ impl PrecomputedAfterKey {
         composite_accessor: &CompositeAccessor,
         source_after_key: &CompositeKey,
         field: &str,
+        missing_order: MissingOrder,
         order: Order,
     ) -> crate::Result<Self> {
         let precomputed_key = match (composite_accessor.column_type, source_after_key) {
-            (ColumnType::I64, key) => PrecomputedAfterKey::precompute_i64(key, order),
-            (ColumnType::U64, key) => PrecomputedAfterKey::precompute_u64(key, order),
-            (ColumnType::F64, key) => PrecomputedAfterKey::precompute_f64(key, order),
+            (_, CompositeKey::F64(f)) if f.is_nan() => {
+                return Err(crate::TantivyError::InvalidArgument(format!(
+                    "unexptected NaN in after key {:?}",
+                    source_after_key
+                )));
+            }
+            (ColumnType::I64, key) => {
+                PrecomputedAfterKey::precompute_i64(key, missing_order, order)
+            }
+            (ColumnType::U64, key) => {
+                PrecomputedAfterKey::precompute_u64(key, missing_order, order)
+            }
+            (ColumnType::F64, key) => {
+                PrecomputedAfterKey::precompute_f64(key, missing_order, order)
+            }
             (ColumnType::Bool, CompositeKey::Bool(key)) => PrecomputedAfterKey::Exact(key.to_u64()),
+            (ColumnType::Bool, CompositeKey::Null) => {
+                precompute_missing_after_key(false, missing_order, order)
+            }
             (ColumnType::Bool, _) => PrecomputedAfterKey::keep_all(order),
             (ColumnType::Str, CompositeKey::Str(key)) => PrecomputedAfterKey::precompute_term_ord(
                 &composite_accessor.str_dict_column,
                 key,
                 field,
             )?,
+            (ColumnType::Str, CompositeKey::Null) => {
+                precompute_missing_after_key(false, missing_order, order)
+            }
             (ColumnType::Str, _) => PrecomputedAfterKey::keep_all(order),
             (ColumnType::DateTime, CompositeKey::Str(key)) => {
                 PrecomputedAfterKey::Exact(parse_date(key)?.to_u64())
@@ -577,6 +576,9 @@ impl PrecomputedAfterKey {
                 PrecomputedAfterKey::precompute_ip_addr(&composite_accessor.column, key, field)?
             }
             (ColumnType::Bytes, _) => panic!("unsupported"),
+            (ColumnType::DateTime | ColumnType::IpAddr, CompositeKey::Null) => {
+                precompute_missing_after_key(false, missing_order, order)
+            }
             (ColumnType::DateTime | ColumnType::IpAddr, _) => {
                 // we don't support fields for which the schema changes
                 return Err(crate::TantivyError::InvalidArgument(format!(
@@ -592,6 +594,54 @@ impl PrecomputedAfterKey {
         match order {
             Order::Asc => PrecomputedAfterKey::Next(0),
             Order::Desc => PrecomputedAfterKey::Next(u64::MAX),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv6Addr;
+
+    use super::super::type_order_key;
+    use super::*;
+    use crate::aggregation::intermediate_agg_result::CompositeIntermediateKey;
+
+    #[test]
+    fn test_sort_order_keys_aligned() {
+        // it is important that the order keys used to order column types and
+        // intermediate key types are the same
+        for order in [Order::Asc, Order::Desc] {
+            assert_eq!(
+                col_type_order_key(&ColumnType::Bool, order),
+                type_order_key(&CompositeIntermediateKey::Bool(true), order)
+            );
+            assert_eq!(
+                col_type_order_key(&ColumnType::Str, order),
+                type_order_key(&CompositeIntermediateKey::Str("".to_string()), order)
+            );
+            assert_eq!(
+                col_type_order_key(&ColumnType::I64, order),
+                type_order_key(&CompositeIntermediateKey::I64(0), order)
+            );
+            assert_eq!(
+                col_type_order_key(&ColumnType::U64, order),
+                type_order_key(&CompositeIntermediateKey::U64(0), order)
+            );
+            assert_eq!(
+                col_type_order_key(&ColumnType::F64, order),
+                type_order_key(&CompositeIntermediateKey::F64(0.0), order)
+            );
+            assert_eq!(
+                col_type_order_key(&ColumnType::DateTime, order),
+                type_order_key(&CompositeIntermediateKey::DateTime(0), order)
+            );
+            assert_eq!(
+                col_type_order_key(&ColumnType::IpAddr, order),
+                type_order_key(
+                    &CompositeIntermediateKey::IpAddr(Ipv6Addr::LOCALHOST),
+                    order
+                )
+            );
         }
     }
 }

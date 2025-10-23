@@ -13,7 +13,7 @@ use super::metric::{
     ExtendedStats, PercentilesMetricResult, SingleMetricResult, Stats, TopHitsMetricResult,
 };
 use super::{AggregationError, Key};
-use crate::aggregation::intermediate_agg_result::IntermediateKey;
+use crate::aggregation::intermediate_agg_result::CompositeIntermediateKey;
 use crate::TantivyError;
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
@@ -165,7 +165,7 @@ pub enum BucketResult {
         buckets: Vec<CompositeBucketEntry>,
         /// The key to start after when paginating
         #[serde(skip_serializing_if = "FxHashMap::is_empty")]
-        after_key: FxHashMap<String, Option<CompositeKey>>,
+        after_key: FxHashMap<String, CompositeKey>,
     },
 }
 
@@ -323,9 +323,9 @@ impl RangeBucketEntry {
     }
 }
 
-/// The key to identify a composite bucket.
+/// The JSON mappable key to identify a composite bucket.
 ///
-/// This is similar to `Key`, but composite keys can also be boolean.
+/// This is similar to `Key`, but composite keys can also be boolean and null.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompositeKey {
@@ -339,6 +339,8 @@ pub enum CompositeKey {
     U64(u64),
     /// `f64` key
     F64(f64),
+    /// Null key
+    Null,
 }
 impl Eq for CompositeKey {}
 impl std::hash::Hash for CompositeKey {
@@ -350,6 +352,7 @@ impl std::hash::Hash for CompositeKey {
             Self::F64(val) => val.to_bits().hash(state),
             Self::U64(val) => val.hash(state),
             Self::I64(val) => val.hash(state),
+            Self::Null => {}
         }
     }
 }
@@ -361,26 +364,24 @@ impl PartialEq for CompositeKey {
             (Self::F64(l), Self::F64(r)) => l.to_bits() == r.to_bits(),
             (Self::I64(l), Self::I64(r)) => l == r,
             (Self::U64(l), Self::U64(r)) => l == r,
-            (Self::Bool(_) | Self::Str(_) | Self::F64(_) | Self::I64(_) | Self::U64(_), _) => false,
+            (Self::Null, Self::Null) => true,
+            (
+                Self::Bool(_)
+                | Self::Str(_)
+                | Self::F64(_)
+                | Self::I64(_)
+                | Self::U64(_)
+                | Self::Null,
+                _,
+            ) => false,
         }
     }
 }
-impl From<CompositeKey> for IntermediateKey {
-    fn from(value: CompositeKey) -> Self {
+impl From<CompositeIntermediateKey> for CompositeKey {
+    fn from(value: CompositeIntermediateKey) -> Self {
         match value {
-            CompositeKey::Bool(b) => Self::Bool(b),
-            CompositeKey::Str(s) => Self::Str(s),
-            CompositeKey::F64(f) => Self::F64(f),
-            CompositeKey::U64(f) => Self::U64(f),
-            CompositeKey::I64(f) => Self::I64(f),
-        }
-    }
-}
-impl From<IntermediateKey> for CompositeKey {
-    fn from(value: IntermediateKey) -> Self {
-        match value {
-            IntermediateKey::Str(s) => Self::Str(s),
-            IntermediateKey::IpAddr(s) => {
+            CompositeIntermediateKey::Str(s) => Self::Str(s),
+            CompositeIntermediateKey::IpAddr(s) => {
                 // Prefer to use the IPv4 representation if possible
                 if let Some(ip) = s.to_ipv4_mapped() {
                     Self::Str(ip.to_string())
@@ -388,10 +389,12 @@ impl From<IntermediateKey> for CompositeKey {
                     Self::Str(s.to_string())
                 }
             }
-            IntermediateKey::F64(f) => Self::F64(f),
-            IntermediateKey::Bool(f) => Self::Bool(f),
-            IntermediateKey::U64(f) => Self::U64(f),
-            IntermediateKey::I64(f) => Self::I64(f),
+            CompositeIntermediateKey::F64(f) => Self::F64(f),
+            CompositeIntermediateKey::Bool(f) => Self::Bool(f),
+            CompositeIntermediateKey::U64(f) => Self::U64(f),
+            CompositeIntermediateKey::I64(f) => Self::I64(f),
+            CompositeIntermediateKey::DateTime(f) => Self::I64(f),
+            CompositeIntermediateKey::Null => Self::Null,
         }
     }
 }
@@ -434,7 +437,7 @@ impl From<IntermediateKey> for CompositeKey {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompositeBucketEntry {
     /// The identifier of the bucket.
-    pub key: FxHashMap<String, Option<CompositeKey>>,
+    pub key: FxHashMap<String, CompositeKey>,
     /// Number of documents in the bucket.
     pub doc_count: u64,
     #[serde(flatten)]

@@ -22,8 +22,8 @@ use crate::aggregation::bucket::{
 };
 use crate::aggregation::format_date;
 use crate::aggregation::intermediate_agg_result::{
-    IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
-    IntermediateCompositeBucketEntry, IntermediateCompositeBucketResult, IntermediateKey,
+    CompositeIntermediateKey, IntermediateAggregationResult, IntermediateAggregationResults,
+    IntermediateBucketResult, IntermediateCompositeBucketEntry, IntermediateCompositeBucketResult,
 };
 use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
 use crate::TantivyError;
@@ -205,7 +205,7 @@ impl SegmentCompositeCollector {
         self,
         agg_data: &AggregationsSegmentCtx,
     ) -> crate::Result<IntermediateCompositeBucketResult> {
-        let mut dict: FxHashMap<Vec<Option<IntermediateKey>>, IntermediateCompositeBucketEntry> =
+        let mut dict: FxHashMap<Vec<CompositeIntermediateKey>, IntermediateCompositeBucketEntry> =
             Default::default();
         dict.reserve(self.buckets.size());
         let composite_data = agg_data.get_composite_req_data(self.accessor_idx);
@@ -360,7 +360,7 @@ fn collect_bucket_with_limit(
 fn resolve_key(
     internal_key: &[InternalValueRepr],
     agg_data: &CompositeAggReqData,
-) -> crate::Result<Vec<Option<IntermediateKey>>> {
+) -> crate::Result<Vec<CompositeIntermediateKey>> {
     internal_key
         .into_iter()
         .enumerate()
@@ -378,7 +378,7 @@ fn resolve_internal_value_repr(
     internal_value_repr: InternalValueRepr,
     source: &CompositeAggregationSource,
     composite_accessors: &[CompositeAccessor],
-) -> crate::Result<Option<IntermediateKey>> {
+) -> crate::Result<CompositeIntermediateKey> {
     let decoded_value_opt = match source {
         CompositeAggregationSource::Terms(source) => internal_value_repr.decode(source.order),
         CompositeAggregationSource::Histogram(source) => internal_value_repr.decode(source.order),
@@ -387,7 +387,7 @@ fn resolve_internal_value_repr(
         }
     };
     let Some((decoded_accessor_idx, val)) = decoded_value_opt else {
-        return Ok(None);
+        return Ok(CompositeIntermediateKey::Null);
     };
     let CompositeAccessor {
         column_type,
@@ -399,11 +399,15 @@ fn resolve_internal_value_repr(
         CompositeAggregationSource::Terms(_) => {
             resolve_term(val, column_type, str_dict_column, column)?
         }
-        CompositeAggregationSource::Histogram(_) => IntermediateKey::F64(f64::from_u64(val)),
-        CompositeAggregationSource::DateHistogram(_) => IntermediateKey::I64(i64::from_u64(val)),
+        CompositeAggregationSource::Histogram(_) => {
+            CompositeIntermediateKey::F64(f64::from_u64(val))
+        }
+        CompositeAggregationSource::DateHistogram(_) => {
+            CompositeIntermediateKey::I64(i64::from_u64(val))
+        }
     };
 
-    Ok(Some(key))
+    Ok(key)
 }
 
 fn resolve_term(
@@ -411,7 +415,7 @@ fn resolve_term(
     column_type: &ColumnType,
     str_dict_column: &Option<StrColumn>,
     column: &Column,
-) -> crate::Result<IntermediateKey> {
+) -> crate::Result<CompositeIntermediateKey> {
     let key = if *column_type == ColumnType::Str {
         let fallback_dict = Dictionary::empty();
         let term_dict = str_dict_column
@@ -422,16 +426,16 @@ fn resolve_term(
         // TODO try use sorted_ords_to_term_cb to batch
         let mut buffer = Vec::new();
         term_dict.ord_to_term(val, &mut buffer)?;
-        IntermediateKey::Str(
+        CompositeIntermediateKey::Str(
             String::from_utf8(buffer.to_vec()).expect("could not convert to String"),
         )
     } else if *column_type == ColumnType::DateTime {
         let val = i64::from_u64(val);
         let date = format_date(val)?;
-        IntermediateKey::Str(date)
+        CompositeIntermediateKey::Str(date)
     } else if *column_type == ColumnType::Bool {
         let val = bool::from_u64(val);
-        IntermediateKey::Bool(val)
+        CompositeIntermediateKey::Bool(val)
     } else if *column_type == ColumnType::IpAddr {
         let compact_space_accessor = column
             .values
@@ -444,20 +448,20 @@ fn resolve_term(
             })?;
         let val: u128 = compact_space_accessor.compact_to_u128(val as u32);
         let val = Ipv6Addr::from_u128(val);
-        IntermediateKey::IpAddr(val)
+        CompositeIntermediateKey::IpAddr(val)
     } else {
         if *column_type == ColumnType::U64 {
-            IntermediateKey::U64(val)
+            CompositeIntermediateKey::U64(val)
         } else if *column_type == ColumnType::I64 {
-            IntermediateKey::I64(i64::from_u64(val))
+            CompositeIntermediateKey::I64(i64::from_u64(val))
         } else {
             let val = f64::from_u64(val);
             let val: NumericalValue = val.into();
 
             match val.normalize() {
-                NumericalValue::U64(val) => IntermediateKey::U64(val),
-                NumericalValue::I64(val) => IntermediateKey::I64(val),
-                NumericalValue::F64(val) => IntermediateKey::F64(val),
+                NumericalValue::U64(val) => CompositeIntermediateKey::U64(val),
+                NumericalValue::I64(val) => CompositeIntermediateKey::I64(val),
+                NumericalValue::F64(val) => CompositeIntermediateKey::F64(val),
             }
         }
     };
