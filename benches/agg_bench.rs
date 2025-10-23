@@ -1,5 +1,6 @@
 use binggan::plugins::PeakMemAllocPlugin;
 use binggan::{black_box, InputGroup, PeakMemAlloc, INSTRUMENTED_SYSTEM};
+use common::DateTime;
 use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -64,6 +65,8 @@ fn bench_agg(mut group: InputGroup<Index>) {
     register!(group, composite_term_many_page_1000);
     register!(group, composite_term_many_page_1000_with_avg_sub_agg);
     register!(group, composite_term_few);
+    register!(group, composite_histogram);
+    register!(group, composite_histogram_calendar);
 
     register!(group, cardinality_agg);
     register!(group, terms_few_with_cardinality_agg);
@@ -272,6 +275,32 @@ fn composite_term_many_page_1000_with_avg_sub_agg(index: &Index) {
     });
     execute_agg(index, agg_req);
 }
+fn composite_histogram(index: &Index) {
+    let agg_req = json!({
+        "my_texts": {
+            "composite": {
+                "sources": [
+                    { "f64_histogram": { "histogram": { "field": "score_f64", "interval": 1 } } }
+                ],
+                "size": 1000
+            }
+        },
+    });
+    execute_agg(index, agg_req);
+}
+fn composite_histogram_calendar(index: &Index) {
+    let agg_req = json!({
+        "my_texts": {
+            "composite": {
+                "sources": [
+                    { "time_histogram": { "date_histogram": { "field": "timestamp", "calendar_interval": "month" } } }
+                ],
+                "size": 1000
+            }
+        },
+    });
+    execute_agg(index, agg_req);
+}
 
 fn execute_agg(index: &Index, agg_req: serde_json::Value) {
     let agg_req: Aggregations = serde_json::from_value(agg_req).unwrap();
@@ -451,6 +480,7 @@ fn get_test_index_bench(cardinality: Cardinality) -> tantivy::Result<Index> {
     let score_field = schema_builder.add_u64_field("score", score_fieldtype.clone());
     let score_field_f64 = schema_builder.add_f64_field("score_f64", score_fieldtype.clone());
     let score_field_i64 = schema_builder.add_i64_field("score_i64", score_fieldtype);
+    let date_field = schema_builder.add_date_field("timestamp", FAST);
     let index = Index::create_from_tempdir(schema_builder.build())?;
     let few_terms_data = ["INFO", "ERROR", "WARN", "DEBUG"];
 
@@ -506,6 +536,7 @@ fn get_test_index_bench(cardinality: Cardinality) -> tantivy::Result<Index> {
                 score_field => val as u64,
                 score_field_f64 => lg_norm.sample(&mut rng),
                 score_field_i64 => val as i64,
+                date_field => DateTime::from_timestamp_millis((val * 1_000_000.) as i64),
             ))?;
             if cardinality == Cardinality::OptionalSparse {
                 for _ in 0..20 {
