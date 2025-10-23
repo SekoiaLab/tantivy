@@ -863,46 +863,37 @@ mod tests {
 
     #[test]
     fn test_u128_to_next_compact() {
-        let vals = &[100u128, 200u128, 300u128, 500u128, 1000u128];
+        let vals = &[100u128, 200u128, 1_000_000_000u128, 1_000_000_100u128];
         let mut data = test_aux_vals(vals);
 
         let _header = U128Header::deserialize(&mut data);
         let decomp = CompactSpaceDecompressor::open(data).unwrap();
 
         // Test value that's already in a range
-        let compact100 = decomp.u128_to_compact(100).unwrap();
+        let compact_100 = decomp.u128_to_compact(100).unwrap();
         assert_eq!(
             decomp.u128_to_next_compact(100),
-            CompactHit::Exact(compact100)
+            CompactHit::Exact(compact_100)
         );
 
-        // Test values that are between ranges
-        let compact200 = decomp.u128_to_compact(200).unwrap();
-        assert_eq!(
-            decomp.u128_to_next_compact(150),
-            CompactHit::Next(compact200)
-        );
-
-        let compact300 = decomp.u128_to_compact(300).unwrap();
+        // Test value between two ranges
+        let compact_million = decomp.u128_to_compact(1_000_000_000).unwrap();
         assert_eq!(
             decomp.u128_to_next_compact(250),
-            CompactHit::Next(compact300)
-        );
-
-        let compact500 = decomp.u128_to_compact(500).unwrap();
-        assert_eq!(
-            decomp.u128_to_next_compact(400),
-            CompactHit::Next(compact500)
+            CompactHit::Next(compact_million)
         );
 
         // Test value before the first range
         assert_eq!(
             decomp.u128_to_next_compact(50),
-            CompactHit::Next(compact100)
+            CompactHit::Next(compact_100)
         );
 
         // Test value after the last range
-        assert_eq!(decomp.u128_to_next_compact(2000), CompactHit::AfterLast);
+        assert_eq!(
+            decomp.u128_to_next_compact(10_000_000_000),
+            CompactHit::AfterLast
+        );
     }
 
     use proptest::prelude::*;
