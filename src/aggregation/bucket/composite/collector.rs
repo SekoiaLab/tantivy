@@ -357,6 +357,8 @@ fn collect_bucket_with_limit(
     Ok(())
 }
 
+/// Converts the composite key from its internal column space representation
+/// (segment specific) into its intermediate form.
 fn resolve_key(
     internal_key: &[InternalValueRepr],
     agg_data: &CompositeAggReqData,

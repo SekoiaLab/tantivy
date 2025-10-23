@@ -24,59 +24,59 @@ use crate::aggregation::deserialize_f64;
 use crate::aggregation::intermediate_agg_result::CompositeIntermediateKey;
 use crate::TantivyError;
 
-/// The position of missing keys in the ordering
+/// Position of missing keys in the ordering.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MissingOrder {
-    /// Missing keys appear first in ascending order, last in descending order
+    /// Missing keys appear first in ascending order, last in descending order.
     #[default]
     Default,
-    /// Missing keys should appear first
+    /// Missing keys should appear first.
     First,
-    /// Missing keys should appear last
+    /// Missing keys should appear last.
     Last,
 }
 
-/// Term source for a composite aggregation
+/// Term source for a composite aggregation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TermCompositeAggregationSource {
-    /// The name used to refer to this source in the composite key
+    /// The name used to refer to this source in the composite key.
     #[serde(skip)]
     pub name: String,
-    /// The field to aggregate on
+    /// The field to aggregate on.
     pub field: String,
-    /// The order for this source
+    /// The order for this source.
     #[serde(default = "Order::asc")]
     pub order: Order,
     /// Whether to create a `null` bucket for documents without value for this
     /// field. By default documents without a value are ignored.
     #[serde(default)]
     pub missing_bucket: bool,
-    /// Whether missing keys should appear first or last
+    /// Whether missing keys should appear first or last.
     #[serde(default)]
     pub missing_order: MissingOrder,
 }
 
-/// Histogram source for a composite aggregation
+/// Histogram source for a composite aggregation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistogramCompositeAggregationSource {
-    /// The name used to refer to this source in the composite key
+    /// The name used to refer to this source in the composite key.
     #[serde(skip)]
     pub name: String,
-    /// The field to aggregate on
+    /// The field to aggregate on.
     pub field: String,
-    /// The interval for the histogram. For datetime fields, this is expressed
+    /// The interval for the histogram. For datetime fields, this is expressed.
     /// in milliseconds.
     #[serde(deserialize_with = "deserialize_f64")]
     pub interval: f64,
-    /// The order for this source
+    /// The order for this source.
     #[serde(default = "Order::asc")]
     pub order: Order,
     /// Whether to create a `null` bucket for documents without value for this
     /// field. By default documents without a value are ignored.
     #[serde(default)]
     pub missing_bucket: bool,
-    /// Whether missing keys should appear first or last
+    /// Whether missing keys should appear first or last.
     #[serde(default)]
     pub missing_order: MissingOrder,
 }
@@ -85,25 +85,25 @@ pub struct HistogramCompositeAggregationSource {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CalendarInterval {
-    /// A year between Jan 1st and Dec 31st, taking into account leap years
+    /// A year between Jan 1st and Dec 31st, taking into account leap years.
     Year,
-    /// A month between the 1st and the last day of the month
+    /// A month between the 1st and the last day of the month.
     Month,
-    /// A week between Monday and Sunday
+    /// A week between Monday and Sunday.
     Week,
 }
 
-/// Date histogram source for a composite aggregation
+/// Date histogram source for a composite aggregation.
 ///
 /// Time zone not supported yet. Every interval is aligned on UTC.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DateHistogramCompositeAggregationSource {
-    /// The name used to refer to this source in the composite key
+    /// The name used to refer to this source in the composite key.
     #[serde(skip)]
     pub name: String,
-    /// The field to aggregate on
+    /// The field to aggregate on.
     pub field: String,
-    /// The fixed interval for the histogram. Either this or `calendar_interval`
+    /// The fixed interval for the histogram. Either this or `calendar_interval`.
     /// must be set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_interval: Option<String>,
@@ -111,7 +111,7 @@ pub struct DateHistogramCompositeAggregationSource {
     /// `fixed_interval` must be set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calendar_interval: Option<CalendarInterval>,
-    /// The order for this source
+    /// The order for this source.
     #[serde(default = "Order::asc")]
     pub order: Order,
     /// Whether to create a `null` bucket for documents without value for this
@@ -119,20 +119,21 @@ pub struct DateHistogramCompositeAggregationSource {
     /// in Elasticsearch.
     #[serde(default)]
     pub missing_bucket: bool,
-    /// Whether missing keys should appear first or last
+    /// Whether missing keys should appear first or last.
     #[serde(default)]
     pub missing_order: MissingOrder,
 }
 
-/// Source for the composite aggregation.
+/// Source for the composite aggregation. A composite aggregation can have
+/// multiple sources.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompositeAggregationSource {
-    /// Terms source
+    /// Terms source.
     Terms(TermCompositeAggregationSource),
-    /// Histogram source
+    /// Histogram source.
     Histogram(HistogramCompositeAggregationSource),
-    /// Date histogram source
+    /// Date histogram source.
     DateHistogram(DateHistogramCompositeAggregationSource),
 }
 
@@ -190,11 +191,11 @@ impl CompositeAggregationSource {
     into = "CompositeAggregationSerde"
 )]
 pub struct CompositeAggregation {
-    /// The fields and bucketting strategies
+    /// The fields and bucketting strategies.
     pub sources: Vec<CompositeAggregationSource>,
-    /// Number of buckets to return (page size)
+    /// Number of buckets to return (page size).
     pub size: u32,
-    /// The key of the last bucket from the previous page
+    /// The key of the previous page's last bucket.
     pub after: FxHashMap<String, CompositeKey>,
 }
 
@@ -270,6 +271,7 @@ impl From<CompositeAggregation> for CompositeAggregationSerde {
     }
 }
 
+/// Ordering key for intermediate composite keys when comparing different types.
 fn type_order_key(key: &CompositeIntermediateKey, order: Order) -> i32 {
     let apply_order = match order {
         Order::Asc => 1,
@@ -287,7 +289,7 @@ fn type_order_key(key: &CompositeIntermediateKey, order: Order) -> i32 {
     }
 }
 
-/// Calculates the ordering between (potentially missing) intermediate keys
+/// Calculates the ordering between intermediate keys.
 pub fn composite_intermediate_key_ordering(
     left_opt: &CompositeIntermediateKey,
     right_opt: &CompositeIntermediateKey,

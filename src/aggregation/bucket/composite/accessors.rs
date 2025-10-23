@@ -20,7 +20,7 @@ use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
 use crate::schema::IntoIpv6Addr;
 use crate::{SegmentReader, TantivyError};
 
-/// Contains all information required by the [SegmentCompositeCollector] to perform the
+/// Contains all information required by the SegmentCompositeCollector to perform the
 /// composite aggregation on a segment.
 pub struct CompositeAggReqData {
     /// Note: sub_aggregation_blueprint is filled later when building collectors
@@ -71,9 +71,9 @@ pub struct CompositeSourceAccessors {
 }
 
 impl CompositeSourceAccessors {
-    /// Creates a new set of accessors for the composite source
+    /// Creates a new set of accessors for the composite source.
     ///
-    /// Precomputes some values to make collection faster
+    /// Precomputes some values to make collection faster.
     pub fn build_for_source(
         reader: &SegmentReader,
         source: &CompositeAggregationSource,
@@ -261,8 +261,6 @@ impl CompositeSourceAccessors {
 /// Sort orders:
 /// - Asc: Bool->Str->F64/I64/U64->DateTime/IpAddr
 /// - Desc: U64/I64/F64->Str->Bool->DateTime/IpAddr
-///
-/// Should be aligned with [super::type_order_key]
 fn col_type_order_key(col_type: &ColumnType, composite_order: Order) -> i32 {
     let apply_order = match composite_order {
         Order::Asc => 1,

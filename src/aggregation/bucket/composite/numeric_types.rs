@@ -1,4 +1,5 @@
-/// This modules helps comparing numerical values of different types.
+/// This modules helps comparing numerical values of different types (i64, u64
+/// and f64).
 pub(super) mod num_cmp {
     use std::cmp::Ordering;
 
@@ -93,11 +94,11 @@ pub(super) mod num_cmp {
 }
 
 /// This modules helps projecting numerical values to other numerical types.
-/// When the target representation cannot exactly represent the source value,
-/// the next representable value is returned (or AfterLast if it is larger than
-/// the largest representable value).
+/// When the target value space cannot exactly represent the source value, the
+/// next representable value is returned (or AfterLast if the source value is
+/// larger than the largest representable value).
 ///
-/// All functions assume that f64 values are not NaN.
+/// All functions in this module assume that f64 values are not NaN.
 pub(super) mod num_proj {
     #[derive(Debug, PartialEq)]
     pub enum ProjectedNumber<T> {
