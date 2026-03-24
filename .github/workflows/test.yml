@@ -14,28 +14,33 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   check:
 
+    permissions:
+      checks: write  # for actions-rs/clippy-check to create and update check runs
+      contents: read  # for actions/checkout to fetch code
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
     - name: Install nightly
-      uses: actions-rs/toolchain@v1
+      uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
       with:
             toolchain: nightly
             profile: minimal
             components: rustfmt
     - name: Install stable
-      uses: actions-rs/toolchain@v1
+      uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
       with:
             toolchain: stable
             profile: minimal
             components: clippy
 
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
 
     - name: Check Formatting
       run: cargo +nightly fmt --all -- --check
@@ -47,7 +52,7 @@ jobs:
     - name: Check Bench Compilation
       run: cargo +nightly bench --no-run --profile=dev --all-features
 
-    - uses: actions-rs/clippy-check@v1
+    - uses: actions-rs/clippy-check@b5b5f21f4797c02da247df37026fcd0a5024aa4d # v1.0.7
       with:
         toolchain: stable
         token: ${{ secrets.GITHUB_TOKEN }}
@@ -55,6 +60,8 @@ jobs:
 
   test:
 
+    permissions:
+      contents: read  # for actions/checkout to fetch code
     runs-on: ubuntu-latest
 
     strategy:
@@ -67,17 +74,17 @@ jobs:
     name: test-${{ matrix.features.label}}
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
     - name: Install stable
-      uses: actions-rs/toolchain@v1
+      uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
       with:
             toolchain: stable
             profile: minimal
             override: true
 
     - uses: taiki-e/install-action@nextest
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
 
     - name: Run tests
       run: cargo +stable nextest run --features ${{ matrix.features.flags }} --verbose --workspace
