@@ -14,9 +14,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   check:
 
+    permissions:
+      checks: write  # for actions-rs/clippy-check to create and update check runs
+      contents: read  # for actions/checkout to fetch code
     runs-on: ubuntu-latest
 
     steps:
@@ -55,6 +60,8 @@ jobs:
 
   test:
 
+    permissions:
+      contents: read  # for actions/checkout to fetch code
     runs-on: ubuntu-latest
 
     strategy:
