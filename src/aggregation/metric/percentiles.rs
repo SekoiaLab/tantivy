@@ -87,12 +87,42 @@ pub struct PercentilesAggregationReq {
         deserialize_with = "deserialize_option_f64"
     )]
     pub missing: Option<f64>,
+    /// An offset subtracted from every value before it is recorded in the underlying sketch, and
+    /// added back to the resulting percentiles.
+    ///
+    /// Percentiles are estimated with a DDSketch, which guarantees a *relative* error (1% by
+    /// default), so the absolute error grows with the magnitude of the values. For fields whose
+    /// values are large but whose interesting spread is comparatively small - most notably
+    /// dates/timestamps, stored as an offset from the Unix epoch - a 1% relative error can
+    /// translate into a very large absolute error (e.g. several months for a timestamp).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "deserialize_option_f64"
+    )]
+    pub offset: Option<f64>,
+    /// The relative accuracy (`alpha`) of the underlying DDSketch, i.e. the maximum relative error
+    /// of the estimated percentiles.
+    ///
+    /// It must be strictly between `0.0` and `1.0`. Smaller values yield more accurate percentiles
+    /// at the cost of more memory and slightly slower collection.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "deserialize_option_f64"
+    )]
+    pub precision: Option<f64>,
 }
 fn default_percentiles() -> &'static [f64] {
     &[1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
 }
 fn default_as_true() -> bool {
     true
+}
+/// The default DDSketch relative accuracy (`alpha`), matching
+/// [`sketches_ddsketch::Config::defaults`].
+pub(crate) fn default_relative_accuracy() -> f64 {
+    0.01
 }
 
 impl PercentilesAggregationReq {
@@ -103,6 +133,8 @@ impl PercentilesAggregationReq {
             percents: None,
             keyed: default_as_true(),
             missing: None,
+            offset: None,
+            precision: None,
         }
     }
     /// Returns the field name the aggregation is computed on.
@@ -126,6 +158,18 @@ impl PercentilesAggregationReq {
             }
         }
 
+        if let Some(precision) = self.precision {
+            if !(precision > 0.0 && precision < 1.0) {
+                return Err(TantivyError::AggregationError(
+                    AggregationError::InvalidRequest(
+                        "The percentiles `precision` (relative accuracy) has to be strictly \
+                         between 0.0 and 1.0"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -140,6 +184,10 @@ pub(crate) struct SegmentPercentilesCollector {
     pub missing_u64: Option<u64>,
     /// The column accessor to access the fast field values.
     pub accessor: Column<u64>,
+    /// Value subtracted from each recorded value (and added back to the final percentiles).
+    pub offset: f64,
+    /// The relative accuracy (DDSketch `alpha`) used to build each per-bucket sketch.
+    pub relative_accuracy: f64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -179,6 +227,7 @@ impl PercentilesCollector {
     /// Convert result into final result. This will query the quantils from the underlying quantil
     /// collector.
     pub fn into_final_result(self, req: &PercentilesAggregationReq) -> PercentilesMetricResult {
+        let offset = req.offset.unwrap_or(0.0);
         let percentiles: &[f64] = req
             .percents
             .as_ref()
@@ -193,6 +242,7 @@ impl PercentilesCollector {
                         "quantil out of range. This error should have been caught during \
                          validation phase",
                     )
+                    .map(|quantile| quantile + offset)
                     .unwrap_or(f64::NAN),
             )
         });
@@ -214,9 +264,17 @@ impl PercentilesCollector {
     }
 
     fn new() -> Self {
-        let ddsketch_config = sketches_ddsketch::Config::defaults();
+        Self::with_relative_accuracy(default_relative_accuracy())
+    }
+    /// Builds a collector whose sketch uses the given relative accuracy (DDSketch `alpha`).
+    fn with_relative_accuracy(relative_accuracy: f64) -> Self {
+        let ddsketch_config = sketches_ddsketch::Config::new(relative_accuracy, 2048, 1.0e-9);
         let sketch = sketches_ddsketch::DDSketch::new(ddsketch_config);
         Self { sketch }
+    }
+    /// Builds an (empty) collector whose sketch matches the configuration requested by `req`.
+    pub(crate) fn from_req(req: &PercentilesAggregationReq) -> Self {
+        Self::with_relative_accuracy(req.precision.unwrap_or_else(default_relative_accuracy))
     }
     fn collect(&mut self, val: f64) {
         self.sketch.add(val);
@@ -244,6 +302,8 @@ impl SegmentPercentilesCollector {
         field_type: ColumnType,
         missing_u64: Option<u64>,
         accessor: Column<u64>,
+        offset: f64,
+        relative_accuracy: f64,
         accessor_idx: usize,
     ) -> Self {
         Self {
@@ -251,6 +311,8 @@ impl SegmentPercentilesCollector {
             field_type,
             missing_u64,
             accessor,
+            offset,
+            relative_accuracy,
             accessor_idx,
         }
     }
@@ -296,7 +358,7 @@ impl SegmentAggregationCollector for SegmentPercentilesCollector {
 
         for val in agg_data.column_block_accessor.iter_vals() {
             let val1 = f64_from_fastfield_u64(val, self.field_type);
-            percentiles.collect(val1);
+            percentiles.collect(val1 - self.offset);
         }
 
         Ok(())
@@ -308,7 +370,10 @@ impl SegmentAggregationCollector for SegmentPercentilesCollector {
         _agg_data: &AggregationsSegmentCtx,
     ) -> crate::Result<()> {
         while self.buckets.len() <= max_bucket as usize {
-            self.buckets.push(PercentilesCollector::new());
+            self.buckets
+                .push(PercentilesCollector::with_relative_accuracy(
+                    self.relative_accuracy,
+                ));
         }
         Ok(())
     }
@@ -423,6 +488,129 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_aggregation_percentile_offset_improves_accuracy() -> crate::Result<()> {
+        let base = 1_780_000_000.0;
+        let num_values = 1000;
+        let all_values: Vec<f64> = (0..num_values).map(|i| base + i as f64 * 86.4).collect();
+        let expected_median = base + (num_values / 2) as f64 * 86.4;
+
+        // Split the values across two segments so the test also exercises cross-segment sketch
+        // merging
+        let mut seg0 = Vec::new();
+        let mut seg1 = Vec::new();
+        for (i, value) in all_values.iter().enumerate() {
+            let entry = (*value, value.to_string());
+            if i % 2 == 0 {
+                seg0.push(entry);
+            } else {
+                seg1.push(entry);
+            }
+        }
+        let index = get_test_index_from_values_and_terms(false, &[seg0, seg1])?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let run = |agg: Aggregations| -> crate::Result<f64> {
+            let collector = AggregationCollector::from_aggs(agg, Default::default());
+            let agg_res: AggregationResults = searcher.search(&AllQuery, &collector).unwrap();
+            let res: Value = serde_json::from_str(&serde_json::to_string(&agg_res)?)?;
+            Ok(res["p"]["values"]["50.0"].as_f64().unwrap())
+        };
+
+        let agg_no_offset: Aggregations = serde_json::from_value(json!({
+            "p": { "percentiles": { "field": "score_f64", "percents": [50] } }
+        }))
+        .unwrap();
+        let median_no_offset = run(agg_no_offset)?;
+        let err_no_offset = (median_no_offset - expected_median).abs();
+
+        let agg_offset: Aggregations = serde_json::from_value(json!({
+            "p": { "percentiles": { "field": "score_f64", "percents": [50], "offset": base } }
+        }))
+        .unwrap();
+        let median_offset = run(agg_offset)?;
+        let err_offset = (median_offset - expected_median).abs();
+
+        // The offset must reduce the absolute error by orders of magnitude.
+        assert!(
+            err_offset < err_no_offset / 100.0,
+            "err_offset={err_offset} err_no_offset={err_no_offset}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregation_percentile_precision_improves_accuracy() -> crate::Result<()> {
+        let num_values = 1000;
+        let all_values: Vec<f64> = (0..num_values).map(|i| 1000.0 + i as f64 * 0.5).collect();
+        // DDSketch picks the value at rank floor(0.5 * (n - 1)).
+        let true_median = 1000.0 + 499.0 * 0.5;
+
+        // Two segments to keep the test fast while still exercising sketch merging.
+        let mut seg0 = Vec::new();
+        let mut seg1 = Vec::new();
+        for (i, value) in all_values.iter().enumerate() {
+            let entry = (*value, value.to_string());
+            if i % 2 == 0 {
+                seg0.push(entry);
+            } else {
+                seg1.push(entry);
+            }
+        }
+        let index = get_test_index_from_values_and_terms(false, &[seg0, seg1])?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let median_for_precision = |precision: Option<f64>| -> crate::Result<f64> {
+            let mut percentiles = json!({ "field": "score_f64", "percents": [50] });
+            if let Some(precision) = precision {
+                percentiles["precision"] = json!(precision);
+            }
+            let agg: Aggregations =
+                serde_json::from_value(json!({ "p": { "percentiles": percentiles } })).unwrap();
+            let collector = AggregationCollector::from_aggs(agg, Default::default());
+            let agg_res: AggregationResults = searcher.search(&AllQuery, &collector).unwrap();
+            let res: Value = serde_json::from_str(&serde_json::to_string(&agg_res)?)?;
+            Ok(res["p"]["values"]["50.0"].as_f64().unwrap())
+        };
+
+        let err_fine = (median_for_precision(Some(0.001))? - true_median).abs();
+        let err_coarse = (median_for_precision(Some(0.3))? - true_median).abs();
+        // Not providing `precision` must behave like passing the DDSketch default (1%).
+        let err_default = (median_for_precision(None)? - true_median).abs();
+        let err_default_explicit = (median_for_precision(Some(0.01))? - true_median).abs();
+
+        // A finer relative accuracy must yield a much more accurate median than a coarse one.
+        assert!(
+            err_fine < err_coarse,
+            "err_fine={err_fine} err_coarse={err_coarse}"
+        );
+        // With alpha = 0.001 the median is pinned within ~2 * alpha of its true value.
+        assert!(err_fine < true_median * 0.005, "err_fine={err_fine}");
+        // Omitting `precision` is equivalent to passing the default value.
+        assert_eq!(err_default, err_default_explicit);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregation_percentile_precision_validation() {
+        for invalid in [0.0, 1.0, -0.5, 2.0] {
+            let mut req =
+                super::PercentilesAggregationReq::from_field_name("score_f64".to_string());
+            req.precision = Some(invalid);
+            assert!(
+                req.validate().is_err(),
+                "precision {invalid} should be rejected"
+            );
+        }
+        let mut req = super::PercentilesAggregationReq::from_field_name("score_f64".to_string());
+        req.precision = Some(0.001);
+        assert!(req.validate().is_ok());
     }
 
     #[test]
