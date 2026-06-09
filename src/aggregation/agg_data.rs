@@ -467,6 +467,8 @@ fn build_nodes(
                     field_type,
                     ColumnType::I64 | ColumnType::U64 | ColumnType::F64 | ColumnType::DateTime
                 ),
+                offset: 0.0,
+                relative_accuracy: crate::aggregation::metric::default_relative_accuracy(),
             });
             let children = build_children(&req.sub_aggregation, reader, segment_ordinal, context)?;
             Ok(vec![AggNode::new(node_data, children)])
@@ -497,6 +499,10 @@ fn build_nodes(
                     field_type,
                     ColumnType::I64 | ColumnType::U64 | ColumnType::F64 | ColumnType::DateTime
                 ),
+                offset: percentiles_req.offset.unwrap_or(0.0),
+                relative_accuracy: percentiles_req
+                    .precision
+                    .unwrap_or_else(crate::aggregation::metric::default_relative_accuracy),
             });
             let children = build_children(&req.sub_aggregation, reader, segment_ordinal, context)?;
             Ok(vec![AggNode::new(node_data, children)])
