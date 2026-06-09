@@ -439,6 +439,8 @@ pub(crate) fn build_segment_agg_collector(
                             req_data.field_type,
                             req_data.missing_u64,
                             req_data.accessor.clone(),
+                            req_data.offset,
+                            req_data.relative_accuracy,
                             node.idx_in_req_data,
                         ),
                     ))
@@ -689,6 +691,8 @@ fn build_nodes(
                     field_type,
                     ColumnType::I64 | ColumnType::U64 | ColumnType::F64 | ColumnType::DateTime
                 ),
+                offset: 0.0,
+                relative_accuracy: crate::aggregation::metric::default_relative_accuracy(),
             });
             let children = build_children(&req.sub_aggregation, reader, segment_ordinal, data)?;
             Ok(vec![AggRefNode {
@@ -718,6 +722,10 @@ fn build_nodes(
                     field_type,
                     ColumnType::I64 | ColumnType::U64 | ColumnType::F64 | ColumnType::DateTime
                 ),
+                offset: percentiles_req.offset.unwrap_or(0.0),
+                relative_accuracy: percentiles_req
+                    .precision
+                    .unwrap_or_else(crate::aggregation::metric::default_relative_accuracy),
             });
             let children = build_children(&req.sub_aggregation, reader, segment_ordinal, data)?;
             Ok(vec![AggRefNode {
