@@ -268,8 +268,8 @@ pub(crate) fn empty_from_req(req: &Aggregation) -> IntermediateAggregationResult
         Sum(_) => IntermediateAggregationResult::Metric(IntermediateMetricResult::Sum(
             IntermediateSum::default(),
         )),
-        Percentiles(_) => IntermediateAggregationResult::Metric(
-            IntermediateMetricResult::Percentiles(PercentilesCollector::default()),
+        Percentiles(ref percentiles_req) => IntermediateAggregationResult::Metric(
+            IntermediateMetricResult::Percentiles(PercentilesCollector::from_req(percentiles_req)),
         ),
         TopHits(ref req) => IntermediateAggregationResult::Metric(
             IntermediateMetricResult::TopHits(TopHitsTopNComputer::new(req)),

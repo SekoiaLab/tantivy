@@ -63,6 +63,11 @@ pub struct MetricAggReqData {
     pub missing: Option<f64>,
     /// The name of the aggregation.
     pub name: String,
+    /// Value subtracted from each recorded value before computing percentiles (and added back to
+    /// the results). Only used by the percentiles aggregation; `0.0` for all other metrics.
+    pub offset: f64,
+    /// The DDSketch relative accuracy (`alpha`) used by the percentiles aggregation.
+    pub relative_accuracy: f64,
 }
 
 impl MetricAggReqData {
