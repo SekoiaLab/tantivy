@@ -5,20 +5,47 @@ use futures_util::{future::Either, FutureExt};
 
 use crate::TantivyError;
 
+/// Abstraction over a rayon-compatible thread pool.
+///
+/// Implementors can wrap [`rayon::ThreadPool`] to add instrumentation (metrics,
+/// tracing, …) around [`scope`](ThreadPool::scope) and [`spawn`](ThreadPool::spawn)
+/// without replacing the underlying scheduler.
+pub trait ThreadPool: Send + Sync {
+    /// Run tasks inside a parallel scope backed by this pool.
+    fn scope<'scope>(&self, op: Box<dyn FnOnce(&rayon::Scope<'scope>) + Send + 'scope>);
+
+    /// Enqueue a fire-and-forget task on this pool.
+    fn spawn(&self, op: Box<dyn FnOnce() + Send + 'static>);
+}
+
+impl ThreadPool for rayon::ThreadPool {
+    fn scope<'scope>(&self, op: Box<dyn FnOnce(&rayon::Scope<'scope>) + Send + 'scope>) {
+        self.scope(op)
+    }
+
+    fn spawn(&self, op: Box<dyn FnOnce() + Send + 'static>) {
+        self.spawn(op)
+    }
+}
+
 /// Executor makes it possible to run tasks in single thread or
 /// in a thread pool.
-#[derive(Clone)]
 pub enum Executor {
     /// Single thread variant of an Executor
     SingleThread,
     /// Thread pool variant of an Executor
     ThreadPool(Arc<rayon::ThreadPool>),
+    /// Thread pool variant of an Executor
+    CustomThreadPool(Arc<dyn ThreadPool>),
 }
 
-#[cfg(feature = "quickwit")]
-impl From<Arc<rayon::ThreadPool>> for Executor {
-    fn from(thread_pool: Arc<rayon::ThreadPool>) -> Self {
-        Executor::ThreadPool(thread_pool)
+impl Clone for Executor {
+    fn clone(&self) -> Self {
+        match self {
+            Executor::SingleThread => Executor::SingleThread,
+            Executor::ThreadPool(pool) => Executor::ThreadPool(Arc::clone(pool)),
+            Executor::CustomThreadPool(pool) => Executor::CustomThreadPool(Arc::clone(pool)),
+        }
     }
 }
 
@@ -98,6 +125,47 @@ impl Executor {
                 }
                 Ok(results)
             }
+            Executor::CustomThreadPool(pool) => {
+                let args: Vec<A> = args.collect();
+                let num_fruits = args.len();
+                let fruit_receiver = {
+                    let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
+                    pool.scope(Box::new(|scope| {
+                        for (idx, arg) in args.into_iter().enumerate() {
+                            // We name references for f and fruit_sender_ref because we do not
+                            // want these two to be moved into the closure.
+                            let f_ref = &f;
+                            let fruit_sender_ref = &fruit_sender;
+                            scope.spawn(move |_| {
+                                let fruit = f_ref(arg);
+                                if let Err(err) = fruit_sender_ref.send((idx, fruit)) {
+                                    error!(
+                                        "Failed to send search task. It probably means all search \
+                                         threads have panicked. {err:?}"
+                                    );
+                                }
+                            });
+                        }
+                    }));
+                    fruit_receiver
+                    // This ends the scope of fruit_sender.
+                    // This is important as it makes it possible for the fruit_receiver iteration to
+                    // terminate.
+                };
+                let mut result_placeholders: Vec<Option<R>> =
+                    std::iter::repeat_with(|| None).take(num_fruits).collect();
+                for (pos, fruit_res) in fruit_receiver {
+                    let fruit = fruit_res?;
+                    result_placeholders[pos] = Some(fruit);
+                }
+                let results: Vec<R> = result_placeholders.into_iter().flatten().collect();
+                if results.len() != num_fruits {
+                    return Err(TantivyError::InternalError(
+                        "One of the mapped execution failed.".to_string(),
+                    ));
+                }
+                Ok(results)
+            }
         }
     }
 
@@ -122,7 +190,20 @@ impl Executor {
                 });
 
                 let res = receiver.map(|res| res.map_err(|_| ()));
-                Either::Right(res)
+                Either::Right(Either::Left(res))
+            }
+            Executor::CustomThreadPool(pool) => {
+                let (sender, receiver) = oneshot::channel();
+                pool.spawn(Box::new(|| {
+                    if sender.is_closed() {
+                        return;
+                    }
+                    let task_result = cpu_intensive_task();
+                    let _ = sender.send(task_result);
+                }));
+
+                let res = receiver.map(|res| res.map_err(|_| ()));
+                Either::Right(Either::Right(res))
             }
         }
     }

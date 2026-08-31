@@ -7,7 +7,7 @@ use std::path::Path;
 
 use once_cell::sync::Lazy;
 
-pub use self::executor::Executor;
+pub use self::executor::{Executor, ThreadPool};
 pub use self::searcher::{Searcher, SearcherGeneration};
 
 /// The meta file contains all the information about the list of segments and the schema
