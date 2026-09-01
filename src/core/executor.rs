@@ -19,10 +19,10 @@ pub trait TaskInstrumentation: Send + Sync {
     }
 }
 
-/// Represents a task that has been enqueued but not yet executed.
+/// Represents a task that has been enqueued but not yet executed. It is dropped
+/// when the task starts running.
 pub trait EnqueuedTask: Send {
-    /// Called when the task starts running. The returned RunningTask instance
-    /// is dropped when the task finishes.
+    /// Called when the task starts running.
     fn run(self: Box<Self>) -> Box<dyn RunningTask>;
 
     /// Called when the task is scheduled in a scoped batch. Scheduling is
@@ -33,6 +33,8 @@ pub trait EnqueuedTask: Send {
     }
 }
 
+/// Represents a task that is currently running. It is dropped when the task
+/// finishes.
 pub trait RunningTask {}
 
 /// Executor makes it possible to run tasks in single thread or
