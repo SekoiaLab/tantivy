@@ -5,6 +5,36 @@ use futures_util::{future::Either, FutureExt};
 
 use crate::TantivyError;
 
+/// Tracks tasks throughout their lifecycle in the thread pool.
+pub trait TaskInstrumentation: Send + Sync {
+    /// Called when a task is added to the queue. Use guards in the
+    /// EnqueuedTask implementation to track how long it stays there.
+    fn enqueue(&self) -> Box<dyn EnqueuedTask>;
+
+    /// Called when a task is scheduled in a scoped batch. Scheduling is
+    /// different from the default spawn approach and we might want to track it
+    /// separately.
+    fn enqueue_scoped(&self) -> Box<dyn EnqueuedTask> {
+        self.enqueue()
+    }
+}
+
+/// Represents a task that has been enqueued but not yet executed.
+pub trait EnqueuedTask: Send {
+    /// Called when the task starts running. The returned RunningTask instance
+    /// is dropped when the task finishes.
+    fn run(self: Box<Self>) -> Box<dyn RunningTask>;
+
+    /// Called when the task is scheduled in a scoped batch. Scheduling is
+    /// different from the default spawn approach and we might want to track it
+    /// separately.
+    fn run_scoped(self: Box<Self>) -> Box<dyn RunningTask> {
+        self.run()
+    }
+}
+
+pub trait RunningTask {}
+
 /// Executor makes it possible to run tasks in single thread or
 /// in a thread pool.
 #[derive(Clone)]
@@ -13,6 +43,8 @@ pub enum Executor {
     SingleThread,
     /// Thread pool variant of an Executor
     ThreadPool(Arc<rayon::ThreadPool>),
+    /// Same as ThreadPool but calling instrumentation
+    InstrumentedThreadPool(Arc<rayon::ThreadPool>, Arc<dyn TaskInstrumentation>),
 }
 
 #[cfg(feature = "quickwit")]
@@ -98,6 +130,51 @@ impl Executor {
                 }
                 Ok(results)
             }
+            Executor::InstrumentedThreadPool(pool, instrumentation) => {
+                let args: Vec<(A, Box<dyn EnqueuedTask>)> = args
+                    .map(|x| (x, instrumentation.enqueue_scoped()))
+                    .collect();
+
+                let num_fruits = args.len();
+                let fruit_receiver = {
+                    let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
+                    pool.scope(|scope| {
+                        for (idx, (arg, enqueued_task)) in args.into_iter().enumerate() {
+                            // We name references for f and fruit_sender_ref because we do not
+                            // want these two to be moved into the closure.
+                            let f_ref = &f;
+                            let fruit_sender_ref = &fruit_sender;
+                            scope.spawn(move |_| {
+                                let _running_task = enqueued_task.run_scoped();
+                                let fruit = f_ref(arg);
+                                if let Err(err) = fruit_sender_ref.send((idx, fruit)) {
+                                    error!(
+                                        "Failed to send search task. It probably means all search \
+                                         threads have panicked. {err:?}"
+                                    );
+                                }
+                            });
+                        }
+                    });
+                    fruit_receiver
+                    // This ends the scope of fruit_sender.
+                    // This is important as it makes it possible for the fruit_receiver iteration to
+                    // terminate.
+                };
+                let mut result_placeholders: Vec<Option<R>> =
+                    std::iter::repeat_with(|| None).take(num_fruits).collect();
+                for (pos, fruit_res) in fruit_receiver {
+                    let fruit = fruit_res?;
+                    result_placeholders[pos] = Some(fruit);
+                }
+                let results: Vec<R> = result_placeholders.into_iter().flatten().collect();
+                if results.len() != num_fruits {
+                    return Err(TantivyError::InternalError(
+                        "One of the mapped execution failed.".to_string(),
+                    ));
+                }
+                Ok(results)
+            }
         }
     }
 
@@ -122,7 +199,22 @@ impl Executor {
                 });
 
                 let res = receiver.map(|res| res.map_err(|_| ()));
-                Either::Right(res)
+                Either::Right(Either::Left(res))
+            }
+            Executor::InstrumentedThreadPool(pool, instrumentation) => {
+                let enqueued_task = instrumentation.enqueue();
+                let (sender, receiver) = oneshot::channel();
+                pool.spawn(|| {
+                    if sender.is_closed() {
+                        return;
+                    }
+                    let _running_task = enqueued_task.run();
+                    let task_result = cpu_intensive_task();
+                    let _ = sender.send(task_result);
+                });
+
+                let res = receiver.map(|res| res.map_err(|_| ()));
+                Either::Right(Either::Right(res))
             }
         }
     }
@@ -130,7 +222,52 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::Executor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::{EnqueuedTask, Executor, RunningTask, TaskInstrumentation};
+
+    struct TestTaskInstrumentation {
+        enqueue_count: Arc<AtomicUsize>,
+        enqueue_scoped_count: Arc<AtomicUsize>,
+        run_count: Arc<AtomicUsize>,
+        run_scoped_count: Arc<AtomicUsize>,
+    }
+    struct TestEnqueuedTask {
+        run_count: Arc<AtomicUsize>,
+        run_scoped_count: Arc<AtomicUsize>,
+    }
+    struct TestRunningTask;
+
+    impl TaskInstrumentation for TestTaskInstrumentation {
+        fn enqueue(&self) -> Box<dyn EnqueuedTask> {
+            self.enqueue_count.fetch_add(1, Ordering::Relaxed);
+            Box::new(TestEnqueuedTask {
+                run_count: Arc::clone(&self.run_count),
+                run_scoped_count: Arc::clone(&self.run_scoped_count),
+            })
+        }
+
+        fn enqueue_scoped(&self) -> Box<dyn EnqueuedTask> {
+            self.enqueue_scoped_count.fetch_add(1, Ordering::Relaxed);
+            Box::new(TestEnqueuedTask {
+                run_count: Arc::clone(&self.run_count),
+                run_scoped_count: Arc::clone(&self.run_scoped_count),
+            })
+        }
+    }
+    impl EnqueuedTask for TestEnqueuedTask {
+        fn run(self: Box<Self>) -> Box<dyn RunningTask> {
+            self.run_count.fetch_add(1, Ordering::Relaxed);
+            Box::new(TestRunningTask)
+        }
+
+        fn run_scoped(self: Box<Self>) -> Box<dyn RunningTask> {
+            self.run_scoped_count.fetch_add(1, Ordering::Relaxed);
+            Box::new(TestRunningTask)
+        }
+    }
+    impl RunningTask for TestRunningTask {}
 
     #[test]
     #[should_panic(expected = "panic should propagate")]
@@ -180,6 +317,64 @@ mod tests {
         for i in 0..10 {
             assert_eq!(result[i], i * 2);
         }
+    }
+
+    #[test]
+    fn test_map_instrumented() {
+        let enqueue_count = Arc::new(AtomicUsize::new(0));
+        let enqueue_scoped_count = Arc::new(AtomicUsize::new(0));
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let run_scoped_count = Arc::new(AtomicUsize::new(0));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let executor = Executor::InstrumentedThreadPool(
+            Arc::new(pool),
+            Arc::new(TestTaskInstrumentation {
+                enqueue_count: Arc::clone(&enqueue_count),
+                enqueue_scoped_count: Arc::clone(&enqueue_scoped_count),
+                run_count: Arc::clone(&run_count),
+                run_scoped_count: Arc::clone(&run_scoped_count),
+            }),
+        );
+        let result: Vec<usize> = executor.map(|i| Ok(i * 2), 0..10).unwrap();
+        assert_eq!(result.len(), 10);
+        for i in 0..10 {
+            assert_eq!(result[i], i * 2);
+        }
+        assert_eq!(enqueue_count.load(Ordering::Relaxed), 0);
+        assert_eq!(enqueue_scoped_count.load(Ordering::Relaxed), 10);
+        assert_eq!(run_count.load(Ordering::Relaxed), 0);
+        assert_eq!(run_scoped_count.load(Ordering::Relaxed), 10);
+    }
+
+    #[cfg(feature = "quickwit")]
+    #[test]
+    fn test_spawn_blocking_instrumented() {
+        let enqueue_count = Arc::new(AtomicUsize::new(0));
+        let enqueue_scoped_count = Arc::new(AtomicUsize::new(0));
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let run_scoped_count = Arc::new(AtomicUsize::new(0));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let executor = Executor::InstrumentedThreadPool(
+            Arc::new(pool),
+            Arc::new(TestTaskInstrumentation {
+                enqueue_count: Arc::clone(&enqueue_count),
+                enqueue_scoped_count: Arc::clone(&enqueue_scoped_count),
+                run_count: Arc::clone(&run_count),
+                run_scoped_count: Arc::clone(&run_scoped_count),
+            }),
+        );
+        let result = futures::executor::block_on(executor.spawn_blocking(|| 42usize)).unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(enqueue_count.load(Ordering::Relaxed), 1);
+        assert_eq!(enqueue_scoped_count.load(Ordering::Relaxed), 0);
+        assert_eq!(run_count.load(Ordering::Relaxed), 1);
+        assert_eq!(run_scoped_count.load(Ordering::Relaxed), 0);
     }
 
     #[cfg(feature = "quickwit")]
