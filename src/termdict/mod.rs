@@ -169,6 +169,25 @@ impl TermDictionary {
     }
 
     #[cfg(feature = "quickwit")]
+    /// Returns the byte ranges within [`Self::sstable_slice`] of the blocks that may contain a
+    /// term accepted by `automaton`. CPU bound, see
+    /// [`sstable::Dictionary::block_byte_ranges_for_automaton`].
+    pub(crate) fn block_byte_ranges_for_automaton<'a>(
+        &'a self,
+        automaton: &'a impl Automaton,
+        merge_holes_under_bytes: usize,
+    ) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+        self.0
+            .block_byte_ranges_for_automaton(automaton, merge_holes_under_bytes)
+    }
+
+    #[cfg(feature = "quickwit")]
+    /// Returns the slice holding the sstable blocks, excluding the index.
+    pub(crate) fn sstable_slice(&self) -> &FileSlice {
+        &self.0.sstable_slice
+    }
+
+    #[cfg(feature = "quickwit")]
     /// Returns a file slice covering a set of sstable blocks
     /// that includes the key range passed in arguments.
     pub fn file_slice_for_range(

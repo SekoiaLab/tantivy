@@ -7,7 +7,7 @@ use futures_util::{FutureExt, StreamExt, TryStreamExt};
 #[cfg(feature = "quickwit")]
 use itertools::Itertools;
 #[cfg(feature = "quickwit")]
-use tantivy_fst::automaton::{AlwaysMatch, Automaton};
+use tantivy_fst::automaton::Automaton;
 
 use crate::directory::FileSlice;
 use crate::positions::PositionReader;
@@ -287,18 +287,16 @@ impl InvertedIndexReader {
         self.termdict.get_async(term.serialized_value_bytes()).await
     }
 
-    async fn get_term_range_async<'a, A: Automaton + 'a>(
+    /// Downloads the term dictionary blocks covering `terms`, and returns the term infos of the
+    /// terms in that range, in order. `limit` bounds both the number of term infos returned and
+    /// the blocks downloaded.
+    async fn get_term_infos_in_range_async<'a>(
         &'a self,
         terms: impl std::ops::RangeBounds<Term>,
-        automaton: A,
         limit: Option<u64>,
-        merge_holes_under_bytes: usize,
-    ) -> io::Result<impl Iterator<Item = TermInfo> + 'a>
-    where
-        A::State: Clone,
-    {
+    ) -> io::Result<impl Iterator<Item = TermInfo> + 'a> {
         use std::ops::Bound;
-        let range_builder = self.termdict.search(automaton);
+        let range_builder = self.termdict.range();
         let range_builder = match terms.start_bound() {
             Bound::Included(bound) => range_builder.ge(bound.serialized_value_bytes()),
             Bound::Excluded(bound) => range_builder.gt(bound.serialized_value_bytes()),
@@ -315,9 +313,7 @@ impl InvertedIndexReader {
             range_builder
         };
 
-        let mut stream = range_builder
-            .into_stream_async_merging_holes(merge_holes_under_bytes)
-            .await?;
+        let mut stream = range_builder.into_stream_async().await?;
 
         let iter = std::iter::from_fn(move || stream.next().map(|(_k, v)| v.clone()));
 
@@ -363,9 +359,7 @@ impl InvertedIndexReader {
         limit: Option<u64>,
         with_positions: bool,
     ) -> io::Result<bool> {
-        let mut term_info = self
-            .get_term_range_async(terms, AlwaysMatch, limit, 0)
-            .await?;
+        let mut term_info = self.get_term_infos_in_range_async(terms, limit).await?;
 
         let Some(first_terminfo) = term_info.next() else {
             // no key matches, nothing more to load
@@ -398,7 +392,7 @@ impl InvertedIndexReader {
     /// returns a boolean, whether a term matching the range was found in the dictionary
     pub async fn warm_postings_automaton<
         A: Automaton + Clone + Send + 'static,
-        E: FnOnce(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
+        E: Fn(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
         F: std::future::Future<Output = io::Result<()>>,
     >(
         &self,
@@ -413,11 +407,13 @@ impl InvertedIndexReader {
         // merge holes under 4MiB, that's how many bytes we can hope to receive during a TTFB from
         // S3 (~80MiB/s, and 50ms latency)
         const MERGE_HOLES_UNDER_BYTES: usize = (80 * 1024 * 1024 * 50) / 1000;
-        // we build a first iterator to download everything. Simply calling the function already
-        // download everything we need from the sstable, but doesn't start iterating over it.
-        let _term_info_iter = self
-            .get_term_range_async(.., automaton.clone(), None, MERGE_HOLES_UNDER_BYTES)
-            .await?;
+
+        self.warm_term_dictionary_blocks_for_automaton(
+            automaton.clone(),
+            MERGE_HOLES_UNDER_BYTES,
+            &executor,
+        )
+        .await?;
 
         let (sender, posting_ranges_to_load_stream) = futures_channel::mpsc::unbounded();
         let termdict = self.termdict.clone();
@@ -470,6 +466,49 @@ impl InvertedIndexReader {
         Ok(!slices_downloaded.is_empty())
     }
 
+    /// Downloads the term dictionary blocks that may contain a term accepted by
+    /// `automaton`, merging blocks less than `merge_holes_under_bytes` apart
+    /// into a single read.
+    ///
+    /// Selecting the blocks runs the automaton on every entry of the sstable
+    /// index, which can be CPU intensive.
+    async fn warm_term_dictionary_blocks_for_automaton<
+        A: Automaton + Send + 'static,
+        E: Fn(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
+        F: std::future::Future<Output = io::Result<()>>,
+    >(
+        &self,
+        automaton: A,
+        merge_holes_under_bytes: usize,
+        executor: &E,
+    ) -> io::Result<()> {
+        let (block_sender, block_ranges_to_load_stream) = futures_channel::mpsc::unbounded();
+        let termdict = self.termdict.clone();
+        let select_blocks_task = move || {
+            for block_range in
+                termdict.block_byte_ranges_for_automaton(&automaton, merge_holes_under_bytes)
+            {
+                if block_sender.unbounded_send(block_range).is_err() {
+                    // this should happen only when search is cancelled
+                    return Err(io::Error::other("failed to send block range back"));
+                }
+            }
+            Ok(())
+        };
+        let select_blocks_handle = executor(Box::new(select_blocks_task));
+        let sstable_slice = self.termdict.sstable_slice();
+        let block_downloader = block_ranges_to_load_stream
+            .map(|block_range| {
+                sstable_slice
+                    .read_bytes_slice_async(block_range)
+                    .map(|result| result.map(|_slice| ()))
+            })
+            .buffer_unordered(5)
+            .try_collect::<Vec<()>>();
+        futures_util::future::try_join(select_blocks_handle, block_downloader).await?;
+        Ok(())
+    }
+
     /// Warmup the block postings for all terms.
     /// This method is for an advanced usage only.
     ///
@@ -490,5 +529,51 @@ impl InvertedIndexReader {
             .await?
             .map(|term_info| term_info.doc_freq)
             .unwrap_or(0u32))
+    }
+}
+
+#[cfg(all(test, feature = "quickwit"))]
+mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tantivy_fst::automaton::Subsequence;
+
+    use crate::schema::{Schema, STRING};
+    use crate::{Index, IndexWriter};
+
+    #[test]
+    fn test_warm_postings_automaton_selects_blocks_on_executor() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_text_field("text", STRING);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        // Enough distinct terms for the term dictionary to span many sstable blocks.
+        for term_id in 0..5_000 {
+            index_writer.add_document(doc!(field => format!("term{term_id:05}")))?;
+        }
+        index_writer.add_document(doc!(field => "banana"))?;
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let inverted_index = searcher.segment_reader(0).inverted_index(field)?;
+
+        let num_executor_calls = AtomicUsize::new(0);
+        let executor = |task: Box<dyn FnOnce() -> io::Result<()> + Send>| {
+            num_executor_calls.fetch_add(1, Ordering::Relaxed);
+            futures::future::ready(task())
+        };
+
+        let found = futures::executor::block_on(
+            inverted_index.warm_postings_automaton(Subsequence::new("banana"), executor),
+        )?;
+        assert!(found);
+        assert_eq!(num_executor_calls.load(Ordering::Relaxed), 2);
+
+        let found = futures::executor::block_on(
+            inverted_index.warm_postings_automaton(Subsequence::new("zzz"), executor),
+        )?;
+        assert!(!found);
+        assert_eq!(num_executor_calls.load(Ordering::Relaxed), 4);
+        Ok(())
     }
 }

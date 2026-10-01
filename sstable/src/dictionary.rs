@@ -277,6 +277,21 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             })
     }
 
+    /// Returns the byte ranges, within the sstable data, of the blocks that may contain a key
+    /// accepted by `automaton`, in increasing order. Blocks less than `merge_holes_under_bytes`
+    /// apart are merged into a single range.
+    ///
+    /// This only reads the sstable index, without any I/O. It is CPU bound: for an automaton
+    /// that doesn't always match, every entry of the index is checked against the automaton.
+    pub fn block_byte_ranges_for_automaton<'a>(
+        &'a self,
+        automaton: &'a impl Automaton,
+        merge_holes_under_bytes: usize,
+    ) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+        self.get_block_iterator_for_range_and_automaton(.., automaton, merge_holes_under_bytes)
+            .map(|block_addr| block_addr.byte_range)
+    }
+
     /// Opens a `TermDictionary`.
     pub fn open(term_dictionary_file: FileSlice) -> io::Result<Self> {
         let num_bytes = term_dictionary_file.num_bytes();
