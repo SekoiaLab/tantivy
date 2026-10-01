@@ -437,14 +437,17 @@ impl InvertedIndexReader {
     /// returns a boolean, whether a term matching the range was found in the dictionary
     pub async fn warm_postings_automaton<
         A: Automaton + Clone + Send + 'static,
-        E: Fn(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
-        F: std::future::Future<Output = io::Result<()>>,
+        E1: FnOnce(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F1,
+        F1: std::future::Future<Output = io::Result<()>>,
+        E2: FnOnce(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F2,
+        F2: std::future::Future<Output = io::Result<()>>,
     >(
         &self,
         automaton: A,
         // with_positions: bool, at the moment we have no use for it, and supporting it would add
         // complexity to the coalesce
-        executor: E,
+        select_blocks_executor: E1,
+        scan_terms_executor: E2,
     ) -> io::Result<bool>
     where
         A::State: Clone,
@@ -452,7 +455,7 @@ impl InvertedIndexReader {
         self.warm_term_dictionary_blocks_for_automaton(
             automaton.clone(),
             MERGE_HOLES_UNDER_BYTES,
-            &executor,
+            select_blocks_executor,
         )
         .await?;
 
@@ -476,7 +479,7 @@ impl InvertedIndexReader {
             });
             send_coalesced_posting_ranges(posting_ranges, sender)
         };
-        let task_handle = executor(Box::new(cpu_bound_task));
+        let task_handle = scan_terms_executor(Box::new(cpu_bound_task));
 
         let (_, postings_found) = futures_util::future::try_join(
             task_handle,
@@ -563,13 +566,13 @@ impl InvertedIndexReader {
     /// index, which can be CPU intensive.
     async fn warm_term_dictionary_blocks_for_automaton<
         A: Automaton + Send + 'static,
-        E: Fn(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
+        E: FnOnce(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
         F: std::future::Future<Output = io::Result<()>>,
     >(
         &self,
         automaton: A,
         merge_holes_under_bytes: usize,
-        executor: &E,
+        executor: E,
     ) -> io::Result<()> {
         let (block_sender, block_ranges_to_load_stream) = futures_channel::mpsc::unbounded();
         let termdict = self.termdict.clone();
@@ -706,23 +709,34 @@ mod tests {
         let searcher = index.reader()?.searcher();
         let inverted_index = searcher.segment_reader(0).inverted_index(field)?;
 
-        let num_executor_calls = AtomicUsize::new(0);
-        let executor = |task: Box<dyn FnOnce() -> io::Result<()> + Send>| {
-            num_executor_calls.fetch_add(1, Ordering::Relaxed);
+        let num_select_blocks_calls = AtomicUsize::new(0);
+        let select_blocks_executor = |task: Box<dyn FnOnce() -> io::Result<()> + Send>| {
+            num_select_blocks_calls.fetch_add(1, Ordering::Relaxed);
+            futures::future::ready(task())
+        };
+        let num_scan_terms_calls = AtomicUsize::new(0);
+        let scan_terms_executor = |task: Box<dyn FnOnce() -> io::Result<()> + Send>| {
+            num_scan_terms_calls.fetch_add(1, Ordering::Relaxed);
             futures::future::ready(task())
         };
 
-        let found = futures::executor::block_on(
-            inverted_index.warm_postings_automaton(Subsequence::new("banana"), executor),
-        )?;
+        let found = futures::executor::block_on(inverted_index.warm_postings_automaton(
+            Subsequence::new("banana"),
+            select_blocks_executor,
+            scan_terms_executor,
+        ))?;
         assert!(found);
-        assert_eq!(num_executor_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(num_select_blocks_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(num_scan_terms_calls.load(Ordering::Relaxed), 1);
 
-        let found = futures::executor::block_on(
-            inverted_index.warm_postings_automaton(Subsequence::new("zzz"), executor),
-        )?;
+        let found = futures::executor::block_on(inverted_index.warm_postings_automaton(
+            Subsequence::new("zzz"),
+            select_blocks_executor,
+            scan_terms_executor,
+        ))?;
         assert!(!found);
-        assert_eq!(num_executor_calls.load(Ordering::Relaxed), 4);
+        assert_eq!(num_select_blocks_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(num_scan_terms_calls.load(Ordering::Relaxed), 2);
         Ok(())
     }
 }
