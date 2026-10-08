@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use common::bounds::{TransformBound, transform_bound_inner_res};
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, ByteCount, OwnedBytes};
+use common::{BinarySerializable, ByteCount, HasLen, OwnedBytes};
 use futures_util::{StreamExt, TryStreamExt, stream};
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use tantivy_fst::Automaton;
 use tantivy_fst::automaton::AlwaysMatch;
 
@@ -297,8 +297,16 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         automaton: &'a impl Automaton,
         merge_holes_under_bytes: usize,
     ) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
-        self.get_block_iterator_for_range_and_automaton(.., automaton, merge_holes_under_bytes)
-            .map(|block_addr| block_addr.byte_range)
+        if automaton.will_always_match(&automaton.start()) {
+            // every block matches: skip scanning the index and return the whole sstable data,
+            // which is also what `sstable_delta_reader_for_key_range` reads for such automatons.
+            let num_bytes = self.sstable_slice.len();
+            return Either::Left((num_bytes > 0).then_some(0..num_bytes).into_iter());
+        }
+        Either::Right(
+            self.get_block_iterator_for_range_and_automaton(.., automaton, merge_holes_under_bytes)
+                .map(|block_addr| block_addr.byte_range),
+        )
     }
 
     /// Opens a `TermDictionary`.
@@ -656,9 +664,11 @@ mod tests {
     use std::ops::{Bound, Range};
     use std::sync::{Arc, Mutex};
 
-    use common::OwnedBytes;
+    use common::{HasLen, OwnedBytes};
+    use tantivy_fst::automaton::AlwaysMatch;
 
     use super::Dictionary;
+    use crate::block_match_automaton::tests::EqBuffer;
     use crate::dictionary::TermOrdHit;
     use crate::{MonotonicU64SSTable, TermOrdinal};
 
@@ -1163,5 +1173,36 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 3); // 0FFFF, 1FFFF, 2FFFF — the dictionary stops below 3FFFF
+    }
+
+    #[test]
+    fn test_block_byte_ranges_for_automaton() {
+        let (dic, _slice) = make_test_sstable();
+        let num_bytes = dic.sstable_slice.len();
+
+        // always matching automaton: fast path, the whole sstable data, which is also what the
+        // sync reader reads for such an automaton
+        let fast_path: Vec<_> = dic
+            .block_byte_ranges_for_automaton(&AlwaysMatch, 0)
+            .collect();
+        assert_eq!(fast_path, vec![0..num_bytes]);
+        assert_eq!(dic.file_slice_for_range(.., None).len(), num_bytes);
+        // scanning the index yields a single range covering every block, i.e. the same range
+        // minus the end of stream marker
+        let scanned: Vec<_> = dic
+            .get_block_iterator_for_range_and_automaton(.., &AlwaysMatch, 0)
+            .map(|block_addr| block_addr.byte_range)
+            .collect();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].start, 0);
+        let last_block_end = scanned[0].end;
+        assert!(last_block_end < num_bytes);
+
+        // selective automaton: only the last block may contain a match
+        let automaton = EqBuffer(b"3FFFE".to_vec());
+        let ranges: Vec<_> = dic.block_byte_ranges_for_automaton(&automaton, 0).collect();
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].start > 0);
+        assert_eq!(ranges[0].end, last_block_end);
     }
 }
