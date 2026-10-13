@@ -19,9 +19,8 @@ use crate::aggregation::bucket::{
 use crate::aggregation::metric::{
     build_segment_stats_collector, AverageAggregation, CardinalityAggReqData,
     CardinalityAggregationReq, CountAggregation, ExtendedStatsAggregation, MaxAggregation,
-    MetricAggReqData, MinAggregation, SegmentCardinalityCollector, SegmentExtendedStatsCollector,
-    SegmentPercentilesCollector, StatsAggregation, StatsType, SumAggregation, TopHitsAggReqData,
-    TopHitsSegmentCollector,
+    MetricAggReqData, MinAggregation, SegmentExtendedStatsCollector, SegmentPercentilesCollector,
+    StatsAggregation, StatsType, SumAggregation, TopHitsAggReqData, TopHitsSegmentCollector,
 };
 use crate::aggregation::segment_agg_result::{
     GenericSegmentAggregationResultsCollector, SegmentAggregationCollector,
@@ -127,14 +126,6 @@ impl AggregationsSegmentCtx {
     #[inline]
     pub(crate) fn get_metric_req_data_mut(&mut self, idx: usize) -> &mut MetricAggReqData {
         &mut self.per_request.stats_metric_req_data[idx]
-    }
-
-    #[inline]
-    pub(crate) fn get_cardinality_req_data_mut(
-        &mut self,
-        idx: usize,
-    ) -> &mut CardinalityAggReqData {
-        &mut self.per_request.cardinality_req_data[idx]
     }
 
     #[inline]
@@ -412,13 +403,7 @@ pub(crate) fn build_segment_agg_collector(
             Ok(Box::new(TermMissingAgg::new(req, node)?))
         }
         AggKind::Cardinality => {
-            let req_data = &mut req.get_cardinality_req_data_mut(node.idx_in_req_data);
-            Ok(Box::new(SegmentCardinalityCollector::from_req(
-                req_data.column_type,
-                node.idx_in_req_data,
-                req_data.accessor.clone(),
-                req_data.missing_value_for_accessor,
-            )))
+            crate::aggregation::metric::build_segment_cardinality_collector(req, node)
         }
         AggKind::StatsKind(stats_type) => {
             let req_data = &mut req.per_request.stats_metric_req_data[node.idx_in_req_data];
@@ -1010,10 +995,20 @@ fn build_terms_or_cardinality_nodes(
                 (idx_in_req_data, AggKind::Terms)
             }
             TermsOrCardinalityRequest::Cardinality(ref req) => {
+                // `str_dict_column` is computed once per field; for JSON paths
+                // with mixed types it's `Some` even on the numeric req_data.
+                // Cardinality only consults it for the str column path, so
+                // gate by column_type to avoid driving non-str collectors
+                // through the coupon-cache path.
+                let str_dict_column_for_req = if column_type == ColumnType::Str {
+                    str_dict_column.clone()
+                } else {
+                    None
+                };
                 let idx_in_req_data = data.push_cardinality_req_data(CardinalityAggReqData {
                     accessor,
                     column_type,
-                    str_dict_column: str_dict_column.clone(),
+                    str_dict_column: str_dict_column_for_req,
                     missing_value_for_accessor,
                     name: agg_name.to_string(),
                     req: req.clone(),

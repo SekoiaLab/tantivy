@@ -21,7 +21,7 @@ use crate::aggregation::bucket::composite::map::{DynArrayHeapMap, MAX_DYN_ARRAY_
 use crate::aggregation::bucket::{
     CalendarInterval, CompositeAggregationSource, MissingOrder, Order,
 };
-use crate::aggregation::cached_sub_aggs::{CachedSubAggs, HighCardSubAggCache};
+use crate::aggregation::buffered_sub_aggs::{BufferedSubAggs, HighCardSubAggBuffer};
 use crate::aggregation::intermediate_agg_result::{
     CompositeIntermediateKey, IntermediateAggregationResult, IntermediateAggregationResults,
     IntermediateBucketResult, IntermediateCompositeBucketEntry, IntermediateCompositeBucketResult,
@@ -119,7 +119,7 @@ pub struct SegmentCompositeCollector {
     /// One DynArrayHeapMap per parent bucket.
     parent_buckets: Vec<DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>>,
     accessor_idx: usize,
-    sub_agg: Option<CachedSubAggs<HighCardSubAggCache>>,
+    sub_agg: Option<BufferedSubAggs<HighCardSubAggBuffer>>,
     bucket_id_provider: BucketIdProvider,
     /// Number of sources, needed when creating new DynArrayHeapMaps.
     num_sources: usize,
@@ -199,6 +199,17 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
         }
         Ok(())
     }
+
+    fn compute_metric_value(
+        &self,
+        _bucket_id: BucketId,
+        _sub_agg_name: &str,
+        _sub_agg_property: &str,
+        _agg_data: &AggregationsSegmentCtx,
+    ) -> Option<f64> {
+        // Composite is a multi-bucket agg with no single value to extract.
+        None
+    }
 }
 
 impl SegmentCompositeCollector {
@@ -215,7 +226,7 @@ impl SegmentCompositeCollector {
         let has_sub_aggregations = !node.children.is_empty();
         let sub_agg = if has_sub_aggregations {
             let sub_agg_collector = build_segment_agg_collectors(req_data, &node.children)?;
-            Some(CachedSubAggs::new(sub_agg_collector))
+            Some(BufferedSubAggs::new(sub_agg_collector))
         } else {
             None
         };
@@ -329,7 +340,7 @@ fn collect_bucket_with_limit(
     limit_num_buckets: usize,
     buckets: &mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
     key: &[InternalValueRepr],
-    sub_agg: &mut Option<CachedSubAggs<HighCardSubAggCache>>,
+    sub_agg: &mut Option<BufferedSubAggs<HighCardSubAggBuffer>>,
     bucket_id_provider: &mut BucketIdProvider,
 ) {
     let mut record_in_bucket = |bucket: &mut CompositeBucketCollector| {
@@ -485,7 +496,7 @@ struct CompositeKeyVisitor<'a> {
     doc_id: crate::DocId,
     composite_agg_data: &'a CompositeAggReqData,
     buckets: &'a mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
-    sub_agg: &'a mut Option<CachedSubAggs<HighCardSubAggCache>>,
+    sub_agg: &'a mut Option<BufferedSubAggs<HighCardSubAggBuffer>>,
     bucket_id_provider: &'a mut BucketIdProvider,
     sub_level_values: SmallVec<[InternalValueRepr; MAX_DYN_ARRAY_SIZE]>,
 }
