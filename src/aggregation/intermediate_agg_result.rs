@@ -361,8 +361,8 @@ pub(crate) fn empty_from_req(req: &Aggregation) -> IntermediateAggregationResult
         TopHits(ref req) => IntermediateAggregationResult::Metric(
             IntermediateMetricResult::TopHits(TopHitsTopNComputer::new(req)),
         ),
-        Cardinality(_) => IntermediateAggregationResult::Metric(
-            IntermediateMetricResult::Cardinality(CardinalityCollector::default()),
+        Cardinality(ref req) => IntermediateAggregationResult::Metric(
+            IntermediateMetricResult::Cardinality(CardinalityCollector::new(0, req.lg_k())),
         ),
         Filter(_) => IntermediateAggregationResult::Bucket(IntermediateBucketResult::Filter {
             doc_count: 0,
