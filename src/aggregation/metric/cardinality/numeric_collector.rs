@@ -44,6 +44,8 @@ pub(crate) struct SegmentNumericCardinalityCollector {
     compact_space_accessor: Option<Arc<CompactSpaceU64Accessor>>,
     /// The missing value normalized to the internal u64 representation of the field type.
     missing_value_for_accessor: Option<u64>,
+    /// Log2 of the number of HLL registers of the bucket sketches.
+    lg_k: u8,
 }
 
 impl Debug for SegmentNumericCardinalityCollector {
@@ -64,8 +66,9 @@ impl SegmentNumericCardinalityCollector {
             accessor,
             missing_value_for_accessor,
             name,
-            ..
+            req,
         } = req_data;
+        let lg_k = req.lg_k();
         let column_type = accessor.column_type();
         assert_ne!(column_type, ColumnType::Str);
         let compact_space_accessor = if column_type == ColumnType::IpAddr {
@@ -100,6 +103,7 @@ impl SegmentNumericCardinalityCollector {
             column_type,
             compact_space_accessor,
             missing_value_for_accessor,
+            lg_k,
         })
     }
 }
@@ -167,8 +171,9 @@ impl SegmentAggregationCollector for SegmentNumericCardinalityCollector {
     ) -> crate::Result<()> {
         if max_bucket as usize >= self.buckets.len() {
             let column_type = self.column_type;
+            let lg_k = self.lg_k;
             self.buckets.resize_with(max_bucket as usize + 1, || {
-                Some(CardinalityCollector::new(column_type as u8))
+                Some(CardinalityCollector::new(column_type as u8, lg_k))
             });
         }
         Ok(())

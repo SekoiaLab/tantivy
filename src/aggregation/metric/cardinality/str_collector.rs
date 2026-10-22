@@ -251,7 +251,7 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
                 "the same bucket should not be finalized twice.".to_string(),
             ));
         };
-        let mut cardinality = CardinalityCollector::new(ColumnType::Str as u8);
+        let mut cardinality = CardinalityCollector::new(ColumnType::Str as u8, req_data.req.lg_k());
         if let Some(coupon_cache) = self.coupon_cache.as_ref() {
             append_to_sketch(&term_ords, coupon_cache, &mut cardinality);
         }
