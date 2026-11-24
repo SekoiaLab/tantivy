@@ -7,7 +7,7 @@ use tokenizer_api::Token;
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::schema::document::{Document, ReferenceValue, ReferenceValueLeaf, Value};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema, Type};
-use crate::tokenizer::{TextAnalyzer, TokenizerManager, RAW_TOKENIZER_NAME};
+use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::{DocId, TantivyError};
 
 /// Only index JSON down to a depth of 20.
@@ -17,23 +17,19 @@ const JSON_DEPTH_LIMIT: usize = 20;
 /// Returns the analyzer applied to the values of a text fast field, or `None` when values are
 /// recorded as is.
 ///
-/// An analyzer registered in the tokenizer manager is always used, including one registered
-/// under the raw tokenizer name: callers may register a raw analyzer with extra filters, such as
-/// a token length limit. Values are recorded as is only when the raw tokenizer is requested and
-/// none is registered.
+/// `tokenizer_name` is `None` when no tokenizer was configured (`FAST` flag). A configured
+/// tokenizer is always looked up, including the raw tokenizer.
 fn resolve_fast_field_tokenizer(
     tokenizer_manager: &TokenizerManager,
-    tokenizer_name: &str,
+    tokenizer_name: Option<&str>,
 ) -> crate::Result<Option<TextAnalyzer>> {
-    if let Some(text_analyzer) = tokenizer_manager.get(tokenizer_name) {
-        return Ok(Some(text_analyzer));
-    }
-    if tokenizer_name == RAW_TOKENIZER_NAME {
+    let Some(tokenizer_name) = tokenizer_name else {
         return Ok(None);
-    }
-    Err(TantivyError::InvalidArgument(format!(
-        "Tokenizer `{tokenizer_name}` not found"
-    )))
+    };
+    let text_analyzer = tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
+        TantivyError::InvalidArgument(format!("Tokenizer `{tokenizer_name}` not found"))
+    })?;
+    Ok(Some(text_analyzer))
 }
 
 /// The `FastFieldsWriter` groups all of the fast field writers.
@@ -84,24 +80,18 @@ impl FastFieldsWriter {
                 date_precisions[field_id.field_id() as usize] = date_options.get_precision();
             }
             if let FieldType::JsonObject(json_object_options) = field_entry.field_type() {
-                if let Some(json_text_fast_field_option) = &json_object_options.fast {
-                    per_field_tokenizer[field_id.field_id() as usize] =
-                        resolve_fast_field_tokenizer(
-                            &tokenizer_manager,
-                            &json_text_fast_field_option.tokenizer,
-                        )?;
-                }
+                per_field_tokenizer[field_id.field_id() as usize] = resolve_fast_field_tokenizer(
+                    &tokenizer_manager,
+                    json_object_options.get_fast_field_tokenizer_name(),
+                )?;
                 expand_dots[field_id.field_id() as usize] =
                     json_object_options.is_expand_dots_enabled();
             }
             if let FieldType::Str(text_options) = field_entry.field_type() {
-                if let Some(fast_field_text_options) = &text_options.fast {
-                    per_field_tokenizer[field_id.field_id() as usize] =
-                        resolve_fast_field_tokenizer(
-                            &tokenizer_manager,
-                            &fast_field_text_options.tokenizer,
-                        )?;
-                }
+                per_field_tokenizer[field_id.field_id() as usize] = resolve_fast_field_tokenizer(
+                    &tokenizer_manager,
+                    text_options.get_fast_field_tokenizer_name(),
+                )?;
             }
 
             let sort_values_within_row = value_type == Type::Facet;
@@ -412,8 +402,8 @@ mod tests {
         let json_field = schema_builder.add_json_field("json", FAST);
         let schema = schema_builder.build();
 
-        // `from_schema` uses an empty tokenizer manager, so this also verifies that the raw
-        // tokenizer is not looked up.
+        // `from_schema` uses an empty tokenizer manager, so this also verifies that no
+        // tokenizer is looked up for the `FAST` flag.
         let fast_fields_writer = FastFieldsWriter::from_schema(&schema).unwrap();
         assert!(fast_fields_writer.per_field_tokenizer[text_field.field_id() as usize].is_none());
         assert!(fast_fields_writer.per_field_tokenizer[json_field.field_id() as usize].is_none());
